@@ -101,6 +101,18 @@ struct MetricData
 
 struct TelemetryState
 {
+    struct SamplingTargetData
+    {
+        explicit SamplingTargetData(SamplingTargetConfig value)
+            : config(std::move(value))
+            , sampler(config.sampling)
+        {
+        }
+
+        SamplingTargetConfig config;
+        StatisticalSampler sampler;
+    };
+
     TelemetryState(SessionConfig value, std::uint64_t id)
         : config(std::move(value))
         , startedAtNs(NowNs())
@@ -129,6 +141,13 @@ struct TelemetryState
 #else
         config.metadata.try_emplace("architecture", "unknown");
 #endif
+        samplingTargets.reserve(config.samplingTargets.size());
+        for (const auto& target : config.samplingTargets) {
+            if (target.name.empty()) {
+                throw std::invalid_argument("telemetry sampling target name cannot be empty");
+            }
+            samplingTargets.emplace_back(target);
+        }
     }
 
     SessionConfig config;
@@ -146,6 +165,7 @@ struct TelemetryState
     std::vector<FrameSnapshot> frames;
     std::vector<AllocationEventSnapshot> allocations;
     std::unordered_map<std::uint64_t, std::size_t> allocationEventIndices;
+    std::vector<SamplingTargetData> samplingTargets;
     std::uint64_t droppedEvents{};
     std::uint64_t allocationTrackingOverflows{};
     std::uint64_t unknownFrees{};
@@ -253,6 +273,10 @@ SessionSnapshot SnapshotState(const TelemetryState& state, std::uint64_t endedAt
     result.events = state.events;
     result.frames = state.frames;
     result.allocations = state.allocations;
+    result.sampling.reserve(state.samplingTargets.size());
+    for (const auto& target : state.samplingTargets) {
+        result.sampling.push_back(target.sampler.Summarize(target.config.name, target.config.category));
+    }
     return result;
 }
 
@@ -305,6 +329,58 @@ bool Session::IsActive() const noexcept
 SessionSnapshot Session::Snapshot() const
 {
     return SnapshotState(*m_impl->state, NowNs());
+}
+
+std::vector<SamplingSummary> Session::SamplingStatus() const
+{
+    if (!m_impl) {
+        return {};
+    }
+    std::scoped_lock lock(m_impl->state->mutex);
+    std::vector<SamplingSummary> result;
+    result.reserve(m_impl->state->samplingTargets.size());
+    for (const auto& target : m_impl->state->samplingTargets) {
+        result.push_back(target.sampler.Summarize(target.config.name, target.config.category));
+    }
+    return result;
+}
+
+bool Session::SamplingConverged() const
+{
+    if (!m_impl) {
+        return false;
+    }
+    std::scoped_lock lock(m_impl->state->mutex);
+    bool foundRequired = false;
+    for (const auto& target : m_impl->state->samplingTargets) {
+        if (!target.config.required) {
+            continue;
+        }
+        foundRequired = true;
+        if (!target.sampler.Converged()) {
+            return false;
+        }
+    }
+    return foundRequired;
+}
+
+bool Session::SamplingComplete() const
+{
+    if (!m_impl) {
+        return false;
+    }
+    std::scoped_lock lock(m_impl->state->mutex);
+    bool foundRequired = false;
+    for (const auto& target : m_impl->state->samplingTargets) {
+        if (!target.config.required) {
+            continue;
+        }
+        foundRequired = true;
+        if (!target.sampler.Complete()) {
+            return false;
+        }
+    }
+    return foundRequired;
 }
 
 void Session::Flush()
@@ -437,6 +513,12 @@ Scope::~Scope()
             aggregate.self.Record(
                 selfNs,
                 m_impl->state->config.retainedSamplesPerMetric);
+            for (auto& target : m_impl->state->samplingTargets) {
+                if (target.config.name == m_impl->callsite->name
+                    && (target.config.category.empty() || target.config.category == m_impl->callsite->category)) {
+                    target.sampler.AddSample(static_cast<double>(inclusiveNs));
+                }
+            }
         }
         if (m_impl->state->config.mode == CaptureMode::Trace) {
             if (m_impl->state->events.size() < m_impl->state->config.maximumTraceEvents) {

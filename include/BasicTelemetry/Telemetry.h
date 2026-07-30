@@ -1,5 +1,7 @@
 #pragma once
 
+#include <BasicTelemetry/Sampling.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -40,6 +42,7 @@ struct SessionConfig
     std::size_t retainedSamplesPerMetric{ 16'384 };
     std::size_t maximumTraceEvents{ 1'000'000 };
     std::unordered_map<std::string, std::string> metadata;
+    std::vector<SamplingTargetConfig> samplingTargets;
 };
 
 struct ScopeDefinition
@@ -144,6 +147,7 @@ struct SessionSnapshot
     std::vector<MetricSnapshot> metrics;
     std::vector<FrameSnapshot> frames;
     std::vector<AllocationEventSnapshot> allocations;
+    std::vector<SamplingSummary> sampling;
 };
 
 class Sink
@@ -164,6 +168,9 @@ public:
 
     [[nodiscard]] bool IsActive() const noexcept;
     [[nodiscard]] SessionSnapshot Snapshot() const;
+    [[nodiscard]] std::vector<SamplingSummary> SamplingStatus() const;
+    [[nodiscard]] bool SamplingConverged() const;
+    [[nodiscard]] bool SamplingComplete() const;
     void Flush();
 
 private:

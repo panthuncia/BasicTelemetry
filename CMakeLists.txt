@@ -13,6 +13,7 @@ find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(Tracy CONFIG REQUIRED)
 
 add_library(BasicTelemetryCore STATIC
+    src/Sampling.cpp
     src/Telemetry.cpp
 )
 add_library(BasicTelemetry::Core ALIAS BasicTelemetryCore)

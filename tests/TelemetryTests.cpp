@@ -2,6 +2,7 @@
 #include <BasicTelemetry/Telemetry.h>
 
 #include <cassert>
+#include <cmath>
 #include <filesystem>
 #include <memory_resource>
 #include <thread>
@@ -130,6 +131,61 @@ void MemoryResourceAndArtifacts()
     assert(std::filesystem::exists(output / "summary.md"));
     std::filesystem::remove_all(output, ignored);
 }
+
+void StatisticalSampling()
+{
+    StatisticalSampler constant({
+        .minimumSamples = 20,
+        .maximumSamples = 100,
+        .confidenceLevel = 0.95,
+        .relativeHalfWidth = 0.01,
+    });
+    for (int index = 0; index < 20; ++index) {
+        constant.AddSample(100.0);
+    }
+    const auto constantSummary = constant.Summarize("constant");
+    assert(constantSummary.converged);
+    assert(constantSummary.confidenceLow == 100.0);
+    assert(constantSummary.confidenceHigh == 100.0);
+
+    StatisticalSampler correlated({
+        .minimumSamples = 20,
+        .maximumSamples = 100,
+        .confidenceLevel = 0.95,
+        .relativeHalfWidth = 0.01,
+    });
+    double value = 0.0;
+    for (int index = 0; index < 80; ++index) {
+        value = 0.95 * value + std::sin(static_cast<double>(index) * 0.17);
+        correlated.AddSample(100.0 + value);
+    }
+    const auto correlatedSummary = correlated.Summarize("correlated");
+    assert(correlatedSummary.effectiveSampleCount <= correlatedSummary.rawSampleCount);
+    assert(correlatedSummary.lag1Autocorrelation > 0.0);
+
+    Session session({
+        .mode = CaptureMode::Summary,
+        .samplingTargets = {
+            {
+                .name = "sample.roi",
+                .category = "test",
+                .sampling = {
+                    .minimumSamples = 2,
+                    .maximumSamples = 2,
+                    .relativeHalfWidth = 0.0,
+                },
+            },
+        },
+    });
+    for (int index = 0; index < 2; ++index) {
+        static const Callsite roi("sample.roi", "test");
+        Scope scope(roi);
+    }
+    const auto status = session.SamplingStatus();
+    assert(status.size() == 1);
+    assert(status.front().rawSampleCount == 2);
+    assert(session.SamplingComplete());
+}
 }
 
 int main()
@@ -140,5 +196,6 @@ int main()
     AsyncContext();
     AllocationOwnership();
     MemoryResourceAndArtifacts();
+    StatisticalSampling();
     return 0;
 }

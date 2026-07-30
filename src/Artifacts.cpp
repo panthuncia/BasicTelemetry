@@ -249,6 +249,30 @@ CREATE TABLE allocations (
     freed_at_ns INTEGER NOT NULL,
     freed_scope_event_id INTEGER NOT NULL
 );
+CREATE TABLE sampling_summary (
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    raw_sample_count INTEGER NOT NULL,
+    minimum_samples INTEGER NOT NULL,
+    maximum_samples INTEGER NOT NULL,
+    confidence_level REAL NOT NULL,
+    target_relative_half_width REAL NOT NULL,
+    target_absolute_half_width REAL,
+    effective_sample_count REAL NOT NULL,
+    mean REAL NOT NULL,
+    standard_deviation REAL NOT NULL,
+    coefficient_of_variation REAL NOT NULL,
+    median REAL NOT NULL,
+    p05 REAL NOT NULL,
+    p95 REAL NOT NULL,
+    confidence_low REAL NOT NULL,
+    confidence_high REAL NOT NULL,
+    relative_half_width REAL NOT NULL,
+    lag1_autocorrelation REAL NOT NULL,
+    mad_outlier_count INTEGER NOT NULL,
+    converged INTEGER NOT NULL,
+    reached_maximum INTEGER NOT NULL
+);
 CREATE VIEW timing_hotspots AS
 SELECT d.name, d.category, s.*
 FROM scope_summary s JOIN scope_definitions d USING(scope_id)
@@ -428,7 +452,52 @@ SELECT * FROM frames WHERE warmup = 0 ORDER BY duration_ns DESC;
             return false;
         }
     }
-    return Execute(database.get(), "COMMIT;", error);
+
+    Statement samplingStatement(
+        database.get(),
+        "INSERT INTO sampling_summary VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        error);
+    for (const auto& sampling : snapshot.sampling) {
+        int column = 1;
+        BindText(samplingStatement.Get(), column++, sampling.name);
+        BindText(samplingStatement.Get(), column++, sampling.category);
+        sqlite3_bind_int64(samplingStatement.Get(), column++, sampling.rawSampleCount);
+        sqlite3_bind_int64(samplingStatement.Get(), column++, sampling.minimumSamples);
+        sqlite3_bind_int64(samplingStatement.Get(), column++, sampling.maximumSamples);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.confidenceLevel);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.targetRelativeHalfWidth);
+        if (sampling.targetAbsoluteHalfWidth) {
+            sqlite3_bind_double(samplingStatement.Get(), column++, *sampling.targetAbsoluteHalfWidth);
+        }
+        else {
+            sqlite3_bind_null(samplingStatement.Get(), column++);
+        }
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.effectiveSampleCount);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.mean);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.standardDeviation);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.coefficientOfVariation);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.median);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.p05);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.p95);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.confidenceLow);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.confidenceHigh);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.relativeHalfWidth);
+        sqlite3_bind_double(samplingStatement.Get(), column++, sampling.lag1Autocorrelation);
+        sqlite3_bind_int64(samplingStatement.Get(), column++, sampling.madOutlierCount);
+        sqlite3_bind_int(samplingStatement.Get(), column++, sampling.converged ? 1 : 0);
+        sqlite3_bind_int(samplingStatement.Get(), column++, sampling.reachedMaximum ? 1 : 0);
+        if (!StepAndReset(samplingStatement.Get(), error)) {
+            return false;
+        }
+    }
+    return Execute(
+        database.get(),
+        "CREATE INDEX scope_events_scope_id ON scope_events(scope_id);"
+        "CREATE INDEX scope_events_parent_event_id ON scope_events(parent_event_id);"
+        "CREATE INDEX scope_events_frame_id ON scope_events(frame_id);"
+        "CREATE INDEX allocations_owner_scope_id ON allocations(owner_scope_id);"
+        "COMMIT;",
+        error);
 }
 
 class ArtifactSink final : public Sink
@@ -491,6 +560,7 @@ bool WriteArtifacts(
         { "dropped_events", snapshot.droppedEvents },
         { "allocation_tracking_overflows", snapshot.allocationTrackingOverflows },
         { "unknown_frees", snapshot.unknownFrees },
+        { "sampling_target_count", snapshot.sampling.size() },
         { "metadata", snapshot.metadata },
     };
     if (!WriteJson(options.outputDirectory / "manifest.json", manifest, error)) {
@@ -543,10 +613,40 @@ bool WriteArtifacts(
             { "distribution", DistributionJson(metric.distribution) },
         });
     }
+    json sampling = json::array();
+    for (const auto& sample : snapshot.sampling) {
+        sampling.push_back({
+            { "name", sample.name },
+            { "category", sample.category },
+            { "raw_sample_count", sample.rawSampleCount },
+            { "minimum_samples", sample.minimumSamples },
+            { "maximum_samples", sample.maximumSamples },
+            { "confidence_level", sample.confidenceLevel },
+            { "target_relative_half_width", sample.targetRelativeHalfWidth },
+            { "target_absolute_half_width", sample.targetAbsoluteHalfWidth
+                ? json(*sample.targetAbsoluteHalfWidth)
+                : json(nullptr) },
+            { "effective_sample_count", sample.effectiveSampleCount },
+            { "mean", sample.mean },
+            { "standard_deviation", sample.standardDeviation },
+            { "coefficient_of_variation", sample.coefficientOfVariation },
+            { "median", sample.median },
+            { "p05", sample.p05 },
+            { "p95", sample.p95 },
+            { "confidence_low", sample.confidenceLow },
+            { "confidence_high", sample.confidenceHigh },
+            { "relative_half_width", sample.relativeHalfWidth },
+            { "lag1_autocorrelation", sample.lag1Autocorrelation },
+            { "mad_outlier_count", sample.madOutlierCount },
+            { "converged", sample.converged },
+            { "reached_maximum", sample.reachedMaximum },
+        });
+    }
     json summary{
         { "schema_version", snapshot.schemaVersion },
         { "scopes", std::move(scopes) },
         { "metrics", std::move(metrics) },
+        { "sampling", std::move(sampling) },
     };
     if (!WriteJson(options.outputDirectory / "summary.json", summary, error)) {
         if (errorOut) {
@@ -632,6 +732,23 @@ bool WriteArtifacts(
         output << "- Frames: " << snapshot.frames.size() << "\n";
         output << "- Dropped events: " << snapshot.droppedEvents << "\n";
         output << "- Allocation overflows: " << snapshot.allocationTrackingOverflows << "\n\n";
+        if (!snapshot.sampling.empty()) {
+            output << "## Statistical sampling\n\n";
+            output << "| Region | Samples | Effective | Mean (ms) | Confidence interval (ms) | Relative half-width | Converged |\n";
+            output << "|---|---:|---:|---:|---:|---:|---:|\n";
+            for (const auto& sample : snapshot.sampling) {
+                output << "| " << sample.name
+                       << " | " << sample.rawSampleCount
+                       << " | " << sample.effectiveSampleCount
+                       << " | " << sample.mean / 1'000'000.0
+                       << " | [" << sample.confidenceLow / 1'000'000.0
+                       << ", " << sample.confidenceHigh / 1'000'000.0 << "]"
+                       << " | " << sample.relativeHalfWidth
+                       << " | " << (sample.converged ? "yes" : "no")
+                       << " |\n";
+            }
+            output << "\n";
+        }
         output << "| Scope | Self total (ms) | Inclusive p95 (ms) | Allocated (bytes) |\n";
         output << "|---|---:|---:|---:|\n";
         const auto& summaryScopes = summary["scopes"];

@@ -284,6 +284,7 @@ void Usage()
         << "basic-telemetry query <profile> [--scope glob] [--metric self|inclusive] [--top N] [--json]\n"
         << "basic-telemetry frames <profile> [--worst N] [--json]\n"
         << "basic-telemetry allocations <profile> [--top N] [--json]\n"
+        << "basic-telemetry sampling <profile> [--json]\n"
         << "basic-telemetry compare <baseline> <candidate> [--threshold fraction] [--json]\n"
         << "basic-telemetry build-index <profile>\n";
 }
@@ -371,6 +372,14 @@ int main(int argc, char** argv)
                 Query(
                     database.value,
                     "SELECT * FROM allocation_hotspots LIMIT " + std::to_string(top)),
+                asJson);
+            return 0;
+        }
+        if (command == "sampling") {
+            PrintRows(
+                Query(
+                    database.value,
+                    "SELECT * FROM sampling_summary ORDER BY name, category"),
                 asJson);
             return 0;
         }
