@@ -48,3 +48,7 @@
 
 #define BT_FRAME_MARK() FrameMark
 #define BT_FRAME_MARK_NAMED(name) FrameMarkNamed(name)
+
+#define BT_ALLOC_N(pointer, size, name) TracyAllocN(pointer, size, name)
+#define BT_FREE_N(pointer, name) TracyFreeN(pointer, name)
+#define BT_TRACY_CONNECTED() TracyIsConnected
