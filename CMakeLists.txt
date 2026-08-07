@@ -7,10 +7,16 @@ include(CMakePackageConfigHelpers)
 
 option(BASICTELEMETRY_BUILD_TESTS "Build BasicTelemetry tests" ON)
 option(BASICTELEMETRY_BUILD_TOOLS "Build the basic-telemetry command-line tool" ON)
+option(BASICTELEMETRY_ENABLE_TRACY "Build Tracy integration" ON)
+option(BASICTELEMETRY_BUILD_ARTIFACTS "Build JSON/SQLite artifact storage" ON)
 
-find_package(nlohmann_json CONFIG REQUIRED)
-find_package(unofficial-sqlite3 CONFIG REQUIRED)
-find_package(Tracy CONFIG REQUIRED)
+if(BASICTELEMETRY_ENABLE_TRACY)
+    find_package(Tracy CONFIG REQUIRED)
+endif()
+if(BASICTELEMETRY_BUILD_ARTIFACTS)
+    find_package(nlohmann_json CONFIG REQUIRED)
+    find_package(unofficial-sqlite3 CONFIG REQUIRED)
+endif()
 
 add_library(BasicTelemetryCore STATIC
     src/Sampling.cpp
@@ -37,23 +43,18 @@ target_include_directories(BasicTelemetryCore
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-add_library(BasicTelemetryTracy INTERFACE)
-add_library(BasicTelemetry::Tracy ALIAS BasicTelemetryTracy)
-set_target_properties(BasicTelemetryTracy PROPERTIES EXPORT_NAME Tracy)
-target_link_libraries(BasicTelemetryTracy
-    INTERFACE
-        BasicTelemetryCore
-        Tracy::TracyClient
-)
-target_include_directories(BasicTelemetryTracy
-    INTERFACE
+if(BASICTELEMETRY_ENABLE_TRACY)
+    add_library(BasicTelemetryTracy INTERFACE)
+    add_library(BasicTelemetry::Tracy ALIAS BasicTelemetryTracy)
+    set_target_properties(BasicTelemetryTracy PROPERTIES EXPORT_NAME Tracy)
+    target_link_libraries(BasicTelemetryTracy INTERFACE BasicTelemetryCore Tracy::TracyClient)
+    target_include_directories(BasicTelemetryTracy INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-)
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+endif()
 
-add_library(BasicTelemetryArtifacts STATIC
-    src/Artifacts.cpp
-)
+if(BASICTELEMETRY_BUILD_ARTIFACTS)
+add_library(BasicTelemetryArtifacts STATIC src/Artifacts.cpp)
 add_library(BasicTelemetry::Artifacts ALIAS BasicTelemetryArtifacts)
 set_target_properties(BasicTelemetryArtifacts PROPERTIES EXPORT_NAME Artifacts)
 target_compile_features(BasicTelemetryArtifacts PUBLIC cxx_std_23)
@@ -69,8 +70,9 @@ target_include_directories(BasicTelemetryArtifacts
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+endif()
 
-if(BASICTELEMETRY_BUILD_TOOLS)
+if(BASICTELEMETRY_BUILD_TOOLS AND BASICTELEMETRY_BUILD_ARTIFACTS)
     add_executable(basic-telemetry tools/basic-telemetry.cpp)
     target_compile_features(basic-telemetry PRIVATE cxx_std_23)
     target_link_libraries(basic-telemetry
@@ -81,7 +83,7 @@ if(BASICTELEMETRY_BUILD_TOOLS)
     )
 endif()
 
-if(BASICTELEMETRY_BUILD_TESTS)
+if(BASICTELEMETRY_BUILD_TESTS AND BASICTELEMETRY_BUILD_ARTIFACTS)
     enable_testing()
     add_executable(BasicTelemetryTests tests/TelemetryTests.cpp)
     target_compile_features(BasicTelemetryTests PRIVATE cxx_std_23)
@@ -92,17 +94,22 @@ if(BASICTELEMETRY_BUILD_TESTS)
     target_link_libraries(BasicTelemetryBenchmark PRIVATE BasicTelemetryCore)
 endif()
 
+set(_basictelemetry_install_targets BasicTelemetryCore)
+if(TARGET BasicTelemetryTracy)
+    list(APPEND _basictelemetry_install_targets BasicTelemetryTracy)
+endif()
+if(TARGET BasicTelemetryArtifacts)
+    list(APPEND _basictelemetry_install_targets BasicTelemetryArtifacts)
+endif()
 install(TARGETS
-    BasicTelemetryCore
-    BasicTelemetryTracy
-    BasicTelemetryArtifacts
+    ${_basictelemetry_install_targets}
     EXPORT BasicTelemetryTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
-if(BASICTELEMETRY_BUILD_TOOLS)
+if(TARGET basic-telemetry)
     install(TARGETS basic-telemetry RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
