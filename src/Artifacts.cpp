@@ -169,6 +169,7 @@ CREATE TABLE session (
     started_ns INTEGER NOT NULL,
     ended_ns INTEGER NOT NULL,
     dropped_events INTEGER NOT NULL,
+    dropped_contended_scope_samples INTEGER NOT NULL,
     allocation_overflows INTEGER NOT NULL,
     unknown_frees INTEGER NOT NULL
 );
@@ -196,6 +197,11 @@ CREATE TABLE scope_summary (
     self_p95_ns INTEGER NOT NULL,
     self_p99_ns INTEGER NOT NULL,
     self_max_ns INTEGER NOT NULL,
+    thread_cpu_total_ns INTEGER NOT NULL,
+    thread_cpu_p99_ns INTEGER NOT NULL,
+    non_running_total_ns INTEGER NOT NULL,
+    non_running_p99_ns INTEGER NOT NULL,
+    non_running_max_ns INTEGER NOT NULL,
     allocated_count INTEGER NOT NULL,
     allocated_bytes INTEGER NOT NULL,
     freed_count INTEGER NOT NULL,
@@ -222,6 +228,8 @@ CREATE TABLE scope_events (
     start_ns INTEGER NOT NULL,
     inclusive_ns INTEGER NOT NULL,
     self_ns INTEGER NOT NULL,
+    thread_cpu_ns INTEGER NOT NULL,
+    non_running_ns INTEGER NOT NULL,
     text TEXT NOT NULL,
     value INTEGER,
     FOREIGN KEY(scope_id) REFERENCES scope_definitions(scope_id)
@@ -291,7 +299,7 @@ SELECT * FROM frames WHERE warmup = 0 ORDER BY duration_ns DESC;
 
     Statement sessionStatement(
         database.get(),
-        "INSERT INTO session VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO session VALUES(?,?,?,?,?,?,?,?)",
         error);
     if (!sessionStatement) {
         return false;
@@ -301,8 +309,9 @@ SELECT * FROM frames WHERE warmup = 0 ORDER BY duration_ns DESC;
     sqlite3_bind_int64(sessionStatement.Get(), 3, snapshot.startedAtNs);
     sqlite3_bind_int64(sessionStatement.Get(), 4, snapshot.endedAtNs);
     sqlite3_bind_int64(sessionStatement.Get(), 5, snapshot.droppedEvents);
-    sqlite3_bind_int64(sessionStatement.Get(), 6, snapshot.allocationTrackingOverflows);
-    sqlite3_bind_int64(sessionStatement.Get(), 7, snapshot.unknownFrees);
+    sqlite3_bind_int64(sessionStatement.Get(), 6, snapshot.droppedContendedScopeSamples);
+    sqlite3_bind_int64(sessionStatement.Get(), 7, snapshot.allocationTrackingOverflows);
+    sqlite3_bind_int64(sessionStatement.Get(), 8, snapshot.unknownFrees);
     if (!StepAndReset(sessionStatement.Get(), error)) {
         return false;
     }
@@ -337,7 +346,7 @@ SELECT * FROM frames WHERE warmup = 0 ORDER BY duration_ns DESC;
 
     Statement scopeStatement(
         database.get(),
-        "INSERT INTO scope_summary VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO scope_summary VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         error);
     for (const auto& scope : snapshot.scopes) {
         const auto inclusiveMean = scope.inclusiveNs.count == 0
@@ -361,6 +370,11 @@ SELECT * FROM frames WHERE warmup = 0 ORDER BY duration_ns DESC;
         sqlite3_bind_int64(scopeStatement.Get(), column++, Percentile(scope.selfNs, 0.95));
         sqlite3_bind_int64(scopeStatement.Get(), column++, Percentile(scope.selfNs, 0.99));
         sqlite3_bind_int64(scopeStatement.Get(), column++, scope.selfNs.maximum);
+        sqlite3_bind_int64(scopeStatement.Get(), column++, scope.threadCpuNs.total);
+        sqlite3_bind_int64(scopeStatement.Get(), column++, Percentile(scope.threadCpuNs, 0.99));
+        sqlite3_bind_int64(scopeStatement.Get(), column++, scope.nonRunningNs.total);
+        sqlite3_bind_int64(scopeStatement.Get(), column++, Percentile(scope.nonRunningNs, 0.99));
+        sqlite3_bind_int64(scopeStatement.Get(), column++, scope.nonRunningNs.maximum);
         sqlite3_bind_int64(scopeStatement.Get(), column++, scope.allocatedCount);
         sqlite3_bind_int64(scopeStatement.Get(), column++, scope.allocatedBytes);
         sqlite3_bind_int64(scopeStatement.Get(), column++, scope.freedCount);
@@ -391,7 +405,7 @@ SELECT * FROM frames WHERE warmup = 0 ORDER BY duration_ns DESC;
 
     Statement eventStatement(
         database.get(),
-        "INSERT INTO scope_events VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO scope_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         error);
     for (const auto& event : snapshot.events) {
         sqlite3_bind_int64(eventStatement.Get(), 1, event.eventId);
@@ -402,12 +416,14 @@ SELECT * FROM frames WHERE warmup = 0 ORDER BY duration_ns DESC;
         sqlite3_bind_int64(eventStatement.Get(), 6, event.startNs);
         sqlite3_bind_int64(eventStatement.Get(), 7, event.inclusiveNs);
         sqlite3_bind_int64(eventStatement.Get(), 8, event.selfNs);
-        BindText(eventStatement.Get(), 9, event.text);
+        sqlite3_bind_int64(eventStatement.Get(), 9, event.threadCpuNs);
+        sqlite3_bind_int64(eventStatement.Get(), 10, event.nonRunningNs);
+        BindText(eventStatement.Get(), 11, event.text);
         if (event.hasValue) {
-            sqlite3_bind_int64(eventStatement.Get(), 10, event.value);
+            sqlite3_bind_int64(eventStatement.Get(), 12, event.value);
         }
         else {
-            sqlite3_bind_null(eventStatement.Get(), 10);
+            sqlite3_bind_null(eventStatement.Get(), 12);
         }
         if (!StepAndReset(eventStatement.Get(), error)) {
             return false;
@@ -558,6 +574,7 @@ bool WriteArtifacts(
         { "ended_ns", snapshot.endedAtNs },
         { "duration_ns", snapshot.endedAtNs - snapshot.startedAtNs },
         { "dropped_events", snapshot.droppedEvents },
+        { "dropped_contended_scope_samples", snapshot.droppedContendedScopeSamples },
         { "allocation_tracking_overflows", snapshot.allocationTrackingOverflows },
         { "unknown_frees", snapshot.unknownFrees },
         { "sampling_target_count", snapshot.sampling.size() },
@@ -581,6 +598,8 @@ bool WriteArtifacts(
             { "category", category },
             { "inclusive_ns", DistributionJson(scope.inclusiveNs) },
             { "self_ns", DistributionJson(scope.selfNs) },
+            { "thread_cpu_ns", DistributionJson(scope.threadCpuNs) },
+            { "non_running_ns", DistributionJson(scope.nonRunningNs) },
             { "allocations", {
                 { "allocated_count", scope.allocatedCount },
                 { "allocated_bytes", scope.allocatedBytes },
@@ -678,7 +697,7 @@ bool WriteArtifacts(
         return false;
     }
 
-    if (snapshot.mode == CaptureMode::Trace) {
+    if (!snapshot.events.empty() || snapshot.mode == CaptureMode::Trace) {
         std::ofstream output(options.outputDirectory / "events.jsonl", std::ios::binary | std::ios::trunc);
         for (const auto& event : snapshot.events) {
             output << json{
@@ -691,6 +710,8 @@ bool WriteArtifacts(
                 { "start_ns", event.startNs },
                 { "inclusive_ns", event.inclusiveNs },
                 { "self_ns", event.selfNs },
+                { "thread_cpu_ns", event.threadCpuNs },
+                { "non_running_ns", event.nonRunningNs },
                 { "text", event.text },
                 { "value", event.hasValue ? json(event.value) : json(nullptr) },
             }.dump() << '\n';

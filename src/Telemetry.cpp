@@ -8,6 +8,15 @@
 #include <stdexcept>
 #include <thread>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#elif defined(__linux__)
+#include <time.h>
+#endif
+
 namespace basic_telemetry
 {
 namespace
@@ -76,6 +85,8 @@ struct ScopeAggregateData
 {
     DistributionData inclusive;
     DistributionData self;
+    DistributionData threadCpu;
+    DistributionData nonRunning;
     std::uint64_t allocatedCount{};
     std::uint64_t allocatedBytes{};
     std::uint64_t freedCount{};
@@ -167,6 +178,7 @@ struct TelemetryState
     std::unordered_map<std::uint64_t, std::size_t> allocationEventIndices;
     std::vector<SamplingTargetData> samplingTargets;
     std::uint64_t droppedEvents{};
+    std::atomic<std::uint64_t> droppedContendedScopeSamples{};
     std::uint64_t allocationTrackingOverflows{};
     std::uint64_t unknownFrees{};
 };
@@ -225,6 +237,8 @@ SessionSnapshot SnapshotState(const TelemetryState& state, std::uint64_t endedAt
     result.startedAtNs = state.startedAtNs;
     result.endedAtNs = endedAt;
     result.droppedEvents = state.droppedEvents;
+    result.droppedContendedScopeSamples =
+        state.droppedContendedScopeSamples.load(std::memory_order_relaxed);
     result.allocationTrackingOverflows = state.allocationTrackingOverflows;
     result.unknownFrees = state.unknownFrees;
     result.metadata = state.config.metadata;
@@ -241,6 +255,8 @@ SessionSnapshot SnapshotState(const TelemetryState& state, std::uint64_t endedAt
             .scopeId = id,
             .inclusiveNs = aggregate.inclusive.Snapshot(),
             .selfNs = aggregate.self.Snapshot(),
+            .threadCpuNs = aggregate.threadCpu.Snapshot(),
+            .nonRunningNs = aggregate.nonRunning.Snapshot(),
             .allocatedCount = aggregate.allocatedCount,
             .allocatedBytes = aggregate.allocatedBytes,
             .freedCount = aggregate.freedCount,
@@ -451,6 +467,7 @@ struct Scope::Impl
     std::uint64_t parentEventId{};
     std::uint64_t frameId{};
     std::uint64_t startNs{};
+    std::uint64_t startThreadCpuNs{};
     std::uint64_t childNs{};
     std::uint64_t threadId{};
     bool warmup{};
@@ -479,6 +496,9 @@ Scope::Scope(const Callsite& callsite) noexcept
         m_impl->eventId = m_impl->state->nextEventId.fetch_add(1, std::memory_order_relaxed);
         m_impl->threadId = ThreadId();
         m_impl->startNs = NowNs();
+        if (m_impl->state->config.measureThreadCpuTime) {
+            m_impl->startThreadCpuNs = CurrentThreadCpuTimeNs();
+        }
         g_threadContext.currentScope = this;
     }
     catch (...) {
@@ -497,13 +517,28 @@ Scope::~Scope()
     const auto endNs = NowNs();
     const auto inclusiveNs = endNs - m_impl->startNs;
     const auto selfNs = inclusiveNs >= m_impl->childNs ? inclusiveNs - m_impl->childNs : 0;
+    const auto endThreadCpuNs = m_impl->state->config.measureThreadCpuTime
+        ? CurrentThreadCpuTimeNs()
+        : 0;
+    const auto threadCpuNs = endThreadCpuNs >= m_impl->startThreadCpuNs
+        ? endThreadCpuNs - m_impl->startThreadCpuNs
+        : 0;
+    const auto nonRunningNs = inclusiveNs >= threadCpuNs ? inclusiveNs - threadCpuNs : 0;
     g_threadContext.currentScope = m_impl->previousScope;
     if (m_impl->previousScope && m_impl->previousScope->m_impl) {
         m_impl->previousScope->m_impl->childNs += inclusiveNs;
     }
 
     try {
-        std::scoped_lock lock(m_impl->state->mutex);
+        // Telemetry must never stall the workload it observes. Scope completion is
+        // extremely hot and previously formed process-wide lock convoys here.
+        std::unique_lock lock(m_impl->state->mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            m_impl->state->droppedContendedScopeSamples.fetch_add(1, std::memory_order_relaxed);
+            m_impl->~Impl();
+            m_impl = nullptr;
+            return;
+        }
         RegisterDefinition(*m_impl->state, *m_impl->callsite);
         if (!m_impl->warmup) {
             auto& aggregate = m_impl->state->scopeAggregates[m_impl->callsite->id];
@@ -513,6 +548,14 @@ Scope::~Scope()
             aggregate.self.Record(
                 selfNs,
                 m_impl->state->config.retainedSamplesPerMetric);
+            if (m_impl->state->config.measureThreadCpuTime) {
+                aggregate.threadCpu.Record(
+                    threadCpuNs,
+                    m_impl->state->config.retainedSamplesPerMetric);
+                aggregate.nonRunning.Record(
+                    nonRunningNs,
+                    m_impl->state->config.retainedSamplesPerMetric);
+            }
             for (auto& target : m_impl->state->samplingTargets) {
                 if (target.config.name == m_impl->callsite->name
                     && (target.config.category.empty() || target.config.category == m_impl->callsite->category)) {
@@ -520,8 +563,13 @@ Scope::~Scope()
                 }
             }
         }
-        if (m_impl->state->config.mode == CaptureMode::Trace) {
-            if (m_impl->state->events.size() < m_impl->state->config.maximumTraceEvents) {
+        const bool retainStall = m_impl->state->config.retainStallEvents
+            && nonRunningNs >= m_impl->state->config.stallEventThresholdNs;
+        if (m_impl->state->config.mode == CaptureMode::Trace || retainStall) {
+            const auto maximumEvents = m_impl->state->config.mode == CaptureMode::Trace
+                ? m_impl->state->config.maximumTraceEvents
+                : m_impl->state->config.maximumStallEvents;
+            if (m_impl->state->events.size() < maximumEvents) {
                 m_impl->state->events.push_back({
                     .eventId = m_impl->eventId,
                     .scopeId = m_impl->callsite->id,
@@ -531,6 +579,8 @@ Scope::~Scope()
                     .startNs = m_impl->startNs - m_impl->state->startedAtNs,
                     .inclusiveNs = inclusiveNs,
                     .selfNs = selfNs,
+                    .threadCpuNs = threadCpuNs,
+                    .nonRunningNs = nonRunningNs,
                     .text = std::move(m_impl->text),
                     .value = m_impl->value,
                     .hasValue = m_impl->hasValue,
@@ -549,7 +599,8 @@ Scope::~Scope()
 
 void Scope::Text(std::string_view text)
 {
-    if (m_impl && m_impl->state->config.mode == CaptureMode::Trace) {
+    if (m_impl && (m_impl->state->config.mode == CaptureMode::Trace
+        || m_impl->state->config.retainStallEvents)) {
         m_impl->text.assign(text);
     }
 }
@@ -755,6 +806,31 @@ std::uint64_t NowNs() noexcept
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
+}
+
+std::uint64_t CurrentThreadCpuTimeNs() noexcept
+{
+#if defined(_WIN32)
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (!GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user)) {
+        return 0;
+    }
+    ULARGE_INTEGER kernelValue{}, userValue{};
+    kernelValue.LowPart = kernel.dwLowDateTime;
+    kernelValue.HighPart = kernel.dwHighDateTime;
+    userValue.LowPart = user.dwLowDateTime;
+    userValue.HighPart = user.dwHighDateTime;
+    return (kernelValue.QuadPart + userValue.QuadPart) * 100ull;
+#elif defined(__linux__)
+    timespec value{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(value.tv_sec) * 1'000'000'000ull
+        + static_cast<std::uint64_t>(value.tv_nsec);
+#else
+    return 0;
+#endif
 }
 
 ContextToken CaptureCurrentContext() noexcept

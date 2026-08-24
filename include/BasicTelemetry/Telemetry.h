@@ -41,6 +41,10 @@ struct SessionConfig
     bool trackAllocations{ false };
     std::size_t retainedSamplesPerMetric{ 16'384 };
     std::size_t maximumTraceEvents{ 1'000'000 };
+    bool measureThreadCpuTime{ false };
+    bool retainStallEvents{ false };
+    std::uint64_t stallEventThresholdNs{ 4'000'000 };
+    std::size_t maximumStallEvents{ 100'000 };
     std::unordered_map<std::string, std::string> metadata;
     std::vector<SamplingTargetConfig> samplingTargets;
 };
@@ -69,6 +73,8 @@ struct ScopeAggregateSnapshot
     StableId scopeId{};
     DistributionSnapshot inclusiveNs;
     DistributionSnapshot selfNs;
+    DistributionSnapshot threadCpuNs;
+    DistributionSnapshot nonRunningNs;
     std::uint64_t allocatedCount{};
     std::uint64_t allocatedBytes{};
     std::uint64_t freedCount{};
@@ -92,6 +98,8 @@ struct ScopeEventSnapshot
     std::uint64_t startNs{};
     std::uint64_t inclusiveNs{};
     std::uint64_t selfNs{};
+    std::uint64_t threadCpuNs{};
+    std::uint64_t nonRunningNs{};
     std::string text;
     std::uint64_t value{};
     bool hasValue{};
@@ -132,12 +140,13 @@ struct AllocationEventSnapshot
 
 struct SessionSnapshot
 {
-    std::uint32_t schemaVersion{ 1 };
+    std::uint32_t schemaVersion{ 2 };
     CaptureMode mode{ CaptureMode::Off };
     bool allocationTrackingEnabled{};
     std::uint64_t startedAtNs{};
     std::uint64_t endedAtNs{};
     std::uint64_t droppedEvents{};
+    std::uint64_t droppedContendedScopeSamples{};
     std::uint64_t allocationTrackingOverflows{};
     std::uint64_t unknownFrees{};
     std::unordered_map<std::string, std::string> metadata;
@@ -293,6 +302,7 @@ private:
 [[nodiscard]] bool Enabled() noexcept;
 [[nodiscard]] CaptureMode CurrentMode() noexcept;
 [[nodiscard]] std::uint64_t NowNs() noexcept;
+[[nodiscard]] std::uint64_t CurrentThreadCpuTimeNs() noexcept;
 [[nodiscard]] ContextToken CaptureCurrentContext() noexcept;
 void AnnotateCurrentScope(std::string_view text);
 void SetCurrentScopeValue(std::uint64_t value) noexcept;
