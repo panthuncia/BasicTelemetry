@@ -186,6 +186,59 @@ void StatisticalSampling()
     assert(status.front().rawSampleCount == 2);
     assert(session.SamplingComplete());
 }
+
+void ConcurrentChunkedTrace()
+{
+    constexpr std::size_t threadCount = 8;
+    constexpr std::size_t eventsPerThread = 5'000;
+    Session session({
+        .mode = CaptureMode::Trace,
+        .retainedSamplesPerMetric = 64,
+        .maximumTraceEvents = 50'000,
+    });
+    std::vector<std::thread> workers;
+    workers.reserve(threadCount);
+    for (std::size_t threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
+        workers.emplace_back([] {
+            static const Callsite callsite("chunked.concurrent");
+            const std::string annotation(256, 'x');
+            for (std::size_t index = 0; index < eventsPerThread; ++index) {
+                Scope scope(callsite);
+                scope.Text(annotation);
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    const auto snapshot = session.Snapshot();
+    assert(snapshot.events.size() == threadCount * eventsPerThread);
+    assert(snapshot.droppedEvents == 0);
+    assert(snapshot.droppedContendedScopeSamples == 0);
+    assert(!snapshot.events.empty());
+    assert(snapshot.events.front().text.size() == 128);
+    const auto aggregate = std::ranges::find_if(snapshot.scopes, [](const auto& scope) {
+        return scope.inclusiveNs.count == threadCount * eventsPerThread;
+    });
+    assert(aggregate != snapshot.scopes.end());
+}
+
+void ConcurrentQuotaExhaustion()
+{
+    constexpr std::size_t threadCount = 8;
+    constexpr std::size_t eventsPerThread = 4'000;
+    Session session({ .mode = CaptureMode::Trace, .maximumTraceEvents = 1'024 });
+    std::vector<std::thread> workers;
+    for (std::size_t threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
+        workers.emplace_back([] {
+            static const Callsite callsite("chunked.quota");
+            for (std::size_t index = 0; index < eventsPerThread; ++index) Scope scope(callsite);
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    const auto snapshot = session.Snapshot();
+    assert(snapshot.events.size() == 1'024);
+    assert(snapshot.droppedEvents == threadCount * eventsPerThread - snapshot.events.size());
+    assert(snapshot.droppedContendedScopeSamples == 0);
+}
 }
 
 int main()
@@ -197,5 +250,7 @@ int main()
     AllocationOwnership();
     MemoryResourceAndArtifacts();
     StatisticalSampling();
+    ConcurrentChunkedTrace();
+    ConcurrentQuotaExhaustion();
     return 0;
 }

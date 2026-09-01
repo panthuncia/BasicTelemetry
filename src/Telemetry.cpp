@@ -1,7 +1,9 @@
 #include <BasicTelemetry/Telemetry.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -79,6 +81,21 @@ struct DistributionData
             .retainedSamples = samples,
         };
     }
+
+    void Merge(const DistributionData& other, std::size_t capacity)
+    {
+        if (other.count == 0) return;
+        const auto oldCount = count;
+        count += other.count;
+        total += other.total;
+        minimum = oldCount == 0 ? other.minimum : std::min(minimum, other.minimum);
+        maximum = std::max(maximum, other.maximum);
+        if (capacity == 0) return;
+        for (const auto sample : other.samples) {
+            if (samples.size() < capacity) samples.push_back(sample);
+            else samples[static_cast<std::size_t>((oldCount + samples.size()) % capacity)] = sample;
+        }
+    }
 };
 
 struct ScopeAggregateData
@@ -112,6 +129,45 @@ struct MetricData
 
 struct TelemetryState
 {
+    static constexpr std::size_t kEventsPerChunk = 1'024;
+    static constexpr std::size_t kInlineTextBytes = 128;
+
+    struct TraceEventRecord {
+        const Callsite* callsite{};
+        std::uint64_t eventId{};
+        std::uint64_t parentEventId{};
+        std::uint64_t frameId{};
+        std::uint64_t threadId{};
+        std::uint64_t startNs{};
+        std::uint64_t inclusiveNs{};
+        std::uint64_t selfNs{};
+        std::uint64_t threadCpuNs{};
+        std::uint64_t nonRunningNs{};
+        std::uint64_t value{};
+        std::uint16_t textSize{};
+        bool hasValue{};
+        std::array<char, kInlineTextBytes> text{};
+    };
+    static_assert(std::is_trivially_copyable_v<TraceEventRecord>);
+
+    struct TraceChunk {
+        std::array<TraceEventRecord, kEventsPerChunk> events{};
+        std::size_t size{};
+        std::size_t capacity{};
+    };
+
+    struct ThreadShard {
+        std::mutex chunkMutex;
+        std::vector<std::unique_ptr<TraceChunk>> chunks;
+        TraceChunk* current{};
+        std::unordered_map<StableId, ScopeAggregateData> scopeAggregates;
+        std::unordered_map<StableId, const Callsite*> definitions;
+        std::atomic<std::uint64_t> droppedEvents{};
+        std::uint64_t nextEventId{};
+        std::uint64_t eventIdEnd{};
+        bool quotaExhausted{};
+    };
+
     struct SamplingTargetData
     {
         explicit SamplingTargetData(SamplingTargetConfig value)
@@ -172,15 +228,76 @@ struct TelemetryState
     std::unordered_map<StableId, ScopeDefinition> definitions;
     std::unordered_map<StableId, ScopeAggregateData> scopeAggregates;
     std::unordered_map<StableId, MetricData> metrics;
-    std::vector<ScopeEventSnapshot> events;
     std::vector<FrameSnapshot> frames;
     std::vector<AllocationEventSnapshot> allocations;
     std::unordered_map<std::uint64_t, std::size_t> allocationEventIndices;
     std::vector<SamplingTargetData> samplingTargets;
-    std::uint64_t droppedEvents{};
+    mutable std::mutex shardsMutex;
+    std::vector<std::shared_ptr<ThreadShard>> shards;
+    std::atomic_size_t reservedEvents{};
+    std::atomic<std::uint64_t> droppedEvents{};
     std::atomic<std::uint64_t> droppedContendedScopeSamples{};
     std::uint64_t allocationTrackingOverflows{};
     std::uint64_t unknownFrees{};
+
+    ThreadShard* ThreadLocalShard()
+    {
+        struct CacheEntry {
+            const TelemetryState* state{};
+            std::uint64_t sessionId{};
+            ThreadShard* shard{};
+        };
+        thread_local CacheEntry cache;
+        if (cache.state == this && cache.sessionId == sessionId) return cache.shard;
+        auto shard = std::make_shared<ThreadShard>();
+        auto* result = shard.get();
+        {
+            std::scoped_lock lock(shardsMutex);
+            shards.push_back(std::move(shard));
+        }
+        cache = { this, sessionId, result };
+        return result;
+    }
+
+    std::uint64_t NextEventId()
+    {
+        auto* shard = ThreadLocalShard();
+        if (shard->nextEventId == shard->eventIdEnd) {
+            constexpr std::uint64_t idsPerBlock = 1'024;
+            const auto begin = nextEventId.fetch_add(idsPerBlock, std::memory_order_relaxed);
+            shard->nextEventId = begin;
+            shard->eventIdEnd = begin + idsPerBlock;
+        }
+        return shard->nextEventId++;
+    }
+
+    void AppendTraceEvent(TraceEventRecord record, std::size_t maximumEvents) noexcept
+    {
+        try {
+            auto* shard = ThreadLocalShard();
+            if (!shard->current || shard->current->size == shard->current->capacity) {
+                if (shard->quotaExhausted) {
+                    shard->droppedEvents.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                const auto begin = reservedEvents.fetch_add(kEventsPerChunk, std::memory_order_relaxed);
+                if (begin >= maximumEvents) {
+                    shard->quotaExhausted = true;
+                    shard->droppedEvents.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                auto chunk = std::make_unique<TraceChunk>();
+                chunk->capacity = std::min(kEventsPerChunk, maximumEvents - begin);
+                std::scoped_lock lock(shard->chunkMutex);
+                shard->current = chunk.get();
+                shard->chunks.push_back(std::move(chunk));
+            }
+            shard->current->events[shard->current->size++] = record;
+        }
+        catch (...) {
+            droppedEvents.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 };
 
 std::atomic<std::shared_ptr<TelemetryState>> g_activeState;
@@ -231,26 +348,69 @@ void RegisterDefinition(TelemetryState& state, const Callsite& callsite)
 SessionSnapshot SnapshotState(const TelemetryState& state, std::uint64_t endedAt)
 {
     std::scoped_lock lock(state.mutex);
+    std::vector<std::shared_ptr<TelemetryState::ThreadShard>> shards;
+    {
+        std::scoped_lock shardsLock(state.shardsMutex);
+        shards = state.shards;
+    }
+    auto mergedAggregates = state.scopeAggregates;
+    auto mergedDefinitions = state.definitions;
+    const auto mergeAggregate = [&](ScopeAggregateData& destination, const ScopeAggregateData& source) {
+        const auto capacity = state.config.retainedSamplesPerMetric;
+        destination.inclusive.Merge(source.inclusive, capacity);
+        destination.self.Merge(source.self, capacity);
+        destination.threadCpu.Merge(source.threadCpu, capacity);
+        destination.nonRunning.Merge(source.nonRunning, capacity);
+        destination.allocatedCount += source.allocatedCount;
+        destination.allocatedBytes += source.allocatedBytes;
+        destination.freedCount += source.freedCount;
+        destination.freedBytes += source.freedBytes;
+        destination.liveBytes += source.liveBytes;
+        destination.peakLiveBytes = std::max(destination.peakLiveBytes, source.peakLiveBytes);
+        destination.largestAllocation = std::max(destination.largestAllocation, source.largestAllocation);
+        destination.freedInSameScope += source.freedInSameScope;
+        destination.freedInSameFrame += source.freedInSameFrame;
+        destination.freedLater += source.freedLater;
+        destination.stillLive += source.stillLive;
+    };
+    for (const auto& shard : shards) {
+        for (const auto& [id, aggregate] : shard->scopeAggregates)
+            mergeAggregate(mergedAggregates[id], aggregate);
+        for (const auto& [id, callsite] : shard->definitions) {
+            if (callsite && !mergedDefinitions.contains(id)) {
+                mergedDefinitions.emplace(id, ScopeDefinition{
+                    .id = id,
+                    .name = std::string(callsite->name),
+                    .category = std::string(callsite->category),
+                    .file = callsite->location.file_name(),
+                    .function = callsite->location.function_name(),
+                    .line = callsite->location.line(),
+                });
+            }
+        }
+    }
     SessionSnapshot result;
     result.mode = state.config.mode;
     result.allocationTrackingEnabled = state.config.trackAllocations;
     result.startedAtNs = state.startedAtNs;
     result.endedAtNs = endedAt;
-    result.droppedEvents = state.droppedEvents;
+    result.droppedEvents = state.droppedEvents.load(std::memory_order_relaxed);
+    for (const auto& shard : shards)
+        result.droppedEvents += shard->droppedEvents.load(std::memory_order_relaxed);
     result.droppedContendedScopeSamples =
         state.droppedContendedScopeSamples.load(std::memory_order_relaxed);
     result.allocationTrackingOverflows = state.allocationTrackingOverflows;
     result.unknownFrees = state.unknownFrees;
     result.metadata = state.config.metadata;
 
-    result.scopeDefinitions.reserve(state.definitions.size());
-    for (const auto& [id, definition] : state.definitions) {
+    result.scopeDefinitions.reserve(mergedDefinitions.size());
+    for (const auto& [id, definition] : mergedDefinitions) {
         result.scopeDefinitions.push_back(definition);
     }
     std::ranges::sort(result.scopeDefinitions, {}, &ScopeDefinition::id);
 
-    result.scopes.reserve(state.scopeAggregates.size());
-    for (const auto& [id, aggregate] : state.scopeAggregates) {
+    result.scopes.reserve(mergedAggregates.size());
+    for (const auto& [id, aggregate] : mergedAggregates) {
         result.scopes.push_back({
             .scopeId = id,
             .inclusiveNs = aggregate.inclusive.Snapshot(),
@@ -286,7 +446,30 @@ SessionSnapshot SnapshotState(const TelemetryState& state, std::uint64_t endedAt
         });
     }
     std::ranges::sort(result.metrics, {}, &MetricSnapshot::id);
-    result.events = state.events;
+    for (const auto& shard : shards) {
+        std::scoped_lock chunkLock(shard->chunkMutex);
+        for (const auto& chunk : shard->chunks) {
+            for (std::size_t index = 0; index < chunk->size; ++index) {
+                const auto& event = chunk->events[index];
+                result.events.push_back({
+                    .eventId = event.eventId,
+                    .scopeId = event.callsite ? event.callsite->id : 0,
+                    .parentEventId = event.parentEventId,
+                    .frameId = event.frameId,
+                    .threadId = event.threadId,
+                    .startNs = event.startNs,
+                    .inclusiveNs = event.inclusiveNs,
+                    .selfNs = event.selfNs,
+                    .threadCpuNs = event.threadCpuNs,
+                    .nonRunningNs = event.nonRunningNs,
+                    .text = std::string(event.text.data(), event.textSize),
+                    .value = event.value,
+                    .hasValue = event.hasValue,
+                });
+            }
+        }
+    }
+    std::ranges::sort(result.events, {}, &ScopeEventSnapshot::eventId);
     result.frames = state.frames;
     result.allocations = state.allocations;
     result.sampling.reserve(state.samplingTargets.size());
@@ -471,7 +654,8 @@ struct Scope::Impl
     std::uint64_t childNs{};
     std::uint64_t threadId{};
     bool warmup{};
-    std::string text;
+    std::array<char, TelemetryState::kInlineTextBytes> text{};
+    std::uint16_t textSize{};
     std::uint64_t value{};
     bool hasValue{};
 };
@@ -493,7 +677,7 @@ Scope::Scope(const Callsite& callsite) noexcept
             : g_threadContext.parentEventId;
         m_impl->frameId = g_threadContext.frameId;
         m_impl->warmup = g_threadContext.warmup;
-        m_impl->eventId = m_impl->state->nextEventId.fetch_add(1, std::memory_order_relaxed);
+        m_impl->eventId = m_impl->state->NextEventId();
         m_impl->threadId = ThreadId();
         m_impl->startNs = NowNs();
         if (m_impl->state->config.measureThreadCpuTime) {
@@ -530,18 +714,10 @@ Scope::~Scope()
     }
 
     try {
-        // Telemetry must never stall the workload it observes. Scope completion is
-        // extremely hot and previously formed process-wide lock convoys here.
-        std::unique_lock lock(m_impl->state->mutex, std::try_to_lock);
-        if (!lock.owns_lock()) {
-            m_impl->state->droppedContendedScopeSamples.fetch_add(1, std::memory_order_relaxed);
-            m_impl->~Impl();
-            m_impl = nullptr;
-            return;
-        }
-        RegisterDefinition(*m_impl->state, *m_impl->callsite);
+        auto* shard = m_impl->state->ThreadLocalShard();
+        shard->definitions.try_emplace(m_impl->callsite->id, m_impl->callsite);
         if (!m_impl->warmup) {
-            auto& aggregate = m_impl->state->scopeAggregates[m_impl->callsite->id];
+            auto& aggregate = shard->scopeAggregates[m_impl->callsite->id];
             aggregate.inclusive.Record(
                 inclusiveNs,
                 m_impl->state->config.retainedSamplesPerMetric);
@@ -556,10 +732,13 @@ Scope::~Scope()
                     nonRunningNs,
                     m_impl->state->config.retainedSamplesPerMetric);
             }
-            for (auto& target : m_impl->state->samplingTargets) {
-                if (target.config.name == m_impl->callsite->name
-                    && (target.config.category.empty() || target.config.category == m_impl->callsite->category)) {
-                    target.sampler.AddSample(static_cast<double>(inclusiveNs));
+            if (!m_impl->state->samplingTargets.empty()) {
+                std::scoped_lock lock(m_impl->state->mutex);
+                for (auto& target : m_impl->state->samplingTargets) {
+                    if (target.config.name == m_impl->callsite->name
+                        && (target.config.category.empty() || target.config.category == m_impl->callsite->category)) {
+                        target.sampler.AddSample(static_cast<double>(inclusiveNs));
+                    }
                 }
             }
         }
@@ -569,26 +748,24 @@ Scope::~Scope()
             const auto maximumEvents = m_impl->state->config.mode == CaptureMode::Trace
                 ? m_impl->state->config.maximumTraceEvents
                 : m_impl->state->config.maximumStallEvents;
-            if (m_impl->state->events.size() < maximumEvents) {
-                m_impl->state->events.push_back({
-                    .eventId = m_impl->eventId,
-                    .scopeId = m_impl->callsite->id,
-                    .parentEventId = m_impl->parentEventId,
-                    .frameId = m_impl->frameId,
-                    .threadId = m_impl->threadId,
-                    .startNs = m_impl->startNs - m_impl->state->startedAtNs,
-                    .inclusiveNs = inclusiveNs,
-                    .selfNs = selfNs,
-                    .threadCpuNs = threadCpuNs,
-                    .nonRunningNs = nonRunningNs,
-                    .text = std::move(m_impl->text),
-                    .value = m_impl->value,
-                    .hasValue = m_impl->hasValue,
-                });
-            }
-            else {
-                ++m_impl->state->droppedEvents;
-            }
+            TelemetryState::TraceEventRecord event{
+                .callsite = m_impl->callsite,
+                .eventId = m_impl->eventId,
+                .parentEventId = m_impl->parentEventId,
+                .frameId = m_impl->frameId,
+                .threadId = m_impl->threadId,
+                .startNs = m_impl->startNs - m_impl->state->startedAtNs,
+                .inclusiveNs = inclusiveNs,
+                .selfNs = selfNs,
+                .threadCpuNs = threadCpuNs,
+                .nonRunningNs = nonRunningNs,
+                .value = m_impl->value,
+                .textSize = m_impl->textSize,
+                .hasValue = m_impl->hasValue,
+            };
+            if (m_impl->textSize != 0)
+                std::memcpy(event.text.data(), m_impl->text.data(), m_impl->textSize);
+            m_impl->state->AppendTraceEvent(std::move(event), maximumEvents);
         }
     }
     catch (...) {
@@ -601,7 +778,10 @@ void Scope::Text(std::string_view text)
 {
     if (m_impl && (m_impl->state->config.mode == CaptureMode::Trace
         || m_impl->state->config.retainStallEvents)) {
-        m_impl->text.assign(text);
+        m_impl->textSize = static_cast<std::uint16_t>(
+            std::min(text.size(), m_impl->text.size()));
+        if (m_impl->textSize != 0)
+            std::memcpy(m_impl->text.data(), text.data(), m_impl->textSize);
     }
 }
 
