@@ -1,7 +1,11 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
-find_dependency(Tracy CONFIG)
-find_dependency(nlohmann_json CONFIG)
-find_dependency(unofficial-sqlite3 CONFIG)
+if(@BASICTELEMETRY_ENABLE_TRACY@)
+    find_dependency(Tracy CONFIG)
+endif()
+if(@BASICTELEMETRY_BUILD_ARTIFACTS@)
+    find_dependency(nlohmann_json CONFIG)
+    find_dependency(unofficial-sqlite3 CONFIG)
+endif()
 include("${CMAKE_CURRENT_LIST_DIR}/BasicTelemetryTargets.cmake")
