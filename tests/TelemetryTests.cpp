@@ -55,6 +55,52 @@ void NestedScopesAndMetrics()
     assert(outer->inclusiveNs >= outer->selfNs);
 }
 
+void FilteredTraceRoots()
+{
+    Session session({ .mode = CaptureMode::Trace, .maximumTraceEvents = 3,
+        .traceRootScopes = { "selected.root" } });
+    static const Callsite outsideCallsite("outside");
+    static const Callsite rootCallsite("selected.root");
+    static const Callsite childCallsite("selected.child");
+    static const Callsite workerCallsite("selected.worker");
+    {
+        Scope outside(outsideCallsite);
+        {
+            Scope root(rootCallsite);
+            const auto token = CaptureCurrentContext();
+            std::thread worker([token] {
+                ContextBinding binding(token);
+                Scope child(workerCallsite);
+            });
+            { Scope child(childCallsite); }
+            worker.join();
+        }
+        // Selection must not leak after the root closes, including through a
+        // context captured outside the selected subtree.
+        const auto token = CaptureCurrentContext();
+        std::thread worker([token] {
+            ContextBinding binding(token);
+            Scope child(workerCallsite);
+        });
+        worker.join();
+    }
+    const auto snapshot = session.Snapshot();
+    assert(snapshot.events.size() == 3);
+    assert(snapshot.scopes.size() == 4); // Summaries still include outside.
+    const auto root = std::ranges::find_if(snapshot.events, [&](const auto& e) {
+        return e.scopeId == rootCallsite.id;
+    });
+    assert(root != snapshot.events.end());
+    for (const auto& event : snapshot.events)
+        if (event.scopeId != rootCallsite.id) assert(event.parentEventId == root->eventId);
+    const auto workers = std::ranges::find_if(snapshot.scopes, [&](const auto& s) {
+        return s.scopeId == workerCallsite.id;
+    });
+    assert(workers != snapshot.scopes.end());
+    assert(workers->inclusiveNs.count == 2);
+    assert(snapshot.droppedEvents == 0);
+}
+
 void AsyncContext()
 {
     Session session({ .mode = CaptureMode::Trace });
@@ -247,6 +293,7 @@ int main()
     NestedScopesAndMetrics();
     assert(!Enabled());
     AsyncContext();
+    FilteredTraceRoots();
     AllocationOwnership();
     MemoryResourceAndArtifacts();
     StatisticalSampling();

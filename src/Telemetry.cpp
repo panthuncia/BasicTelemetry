@@ -310,6 +310,7 @@ struct ThreadContext
     std::uint64_t parentEventId{};
     std::uint64_t frameId{};
     bool warmup{};
+    bool traceSelected{};
 };
 
 thread_local ThreadContext g_threadContext;
@@ -630,6 +631,7 @@ ContextBinding::ContextBinding(const ContextToken& token) noexcept
     g_threadContext.currentScope = nullptr;
     g_threadContext.parentEventId = token.m_parentEventId;
     g_threadContext.frameId = token.m_frameId;
+    g_threadContext.traceSelected = token.m_traceSelected;
 }
 
 ContextBinding::~ContextBinding()
@@ -654,6 +656,7 @@ struct Scope::Impl
     std::uint64_t childNs{};
     std::uint64_t threadId{};
     bool warmup{};
+    bool traceSelected{};
     std::array<char, TelemetryState::kInlineTextBytes> text{};
     std::uint16_t textSize{};
     std::uint64_t value{};
@@ -677,6 +680,11 @@ Scope::Scope(const Callsite& callsite) noexcept
             : g_threadContext.parentEventId;
         m_impl->frameId = g_threadContext.frameId;
         m_impl->warmup = g_threadContext.warmup;
+        const auto& roots = m_impl->state->config.traceRootScopes;
+        m_impl->traceSelected = roots.empty()
+            || (m_impl->previousScope && m_impl->previousScope->m_impl
+                ? m_impl->previousScope->m_impl->traceSelected : g_threadContext.traceSelected)
+            || std::ranges::find(roots, callsite.name) != roots.end();
         m_impl->eventId = m_impl->state->NextEventId();
         m_impl->threadId = ThreadId();
         m_impl->startNs = NowNs();
@@ -744,7 +752,7 @@ Scope::~Scope()
         }
         const bool retainStall = m_impl->state->config.retainStallEvents
             && nonRunningNs >= m_impl->state->config.stallEventThresholdNs;
-        if (m_impl->state->config.mode == CaptureMode::Trace || retainStall) {
+        if (m_impl->traceSelected && (m_impl->state->config.mode == CaptureMode::Trace || retainStall)) {
             const auto maximumEvents = m_impl->state->config.mode == CaptureMode::Trace
                 ? m_impl->state->config.maximumTraceEvents
                 : m_impl->state->config.maximumStallEvents;
@@ -800,6 +808,7 @@ ContextToken Scope::CaptureContext() const noexcept
         token.m_session = m_impl->state;
         token.m_parentEventId = m_impl->eventId;
         token.m_frameId = m_impl->frameId;
+        token.m_traceSelected = m_impl->traceSelected;
     }
     return token;
 }
@@ -991,16 +1000,27 @@ std::uint64_t NowNs() noexcept
 std::uint64_t CurrentThreadCpuTimeNs() noexcept
 {
 #if defined(_WIN32)
-    FILETIME creation{}, exit{}, kernel{}, user{};
-    if (!GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user)) {
+    // GetThreadTimes advances in scheduler quanta (15.6 ms), which makes the
+    // per-scope non-running time meaningless for scopes shorter than that.
+    // QueryThreadCycleTime is exact; cycles are converted with a ratio measured
+    // once while this thread is known to be running.
+    static const double nsPerCycle = [] {
+        ULONG64 cyclesBegin = 0, cyclesEnd = 0;
+        LARGE_INTEGER frequency{}, begin{}, now{};
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&begin);
+        QueryThreadCycleTime(GetCurrentThread(), &cyclesBegin);
+        do { QueryPerformanceCounter(&now); } while ((now.QuadPart - begin.QuadPart) * 1000 < frequency.QuadPart * 4); // ~4 ms
+        QueryThreadCycleTime(GetCurrentThread(), &cyclesEnd);
+        const double elapsedNs = static_cast<double>(now.QuadPart - begin.QuadPart) * 1e9 / static_cast<double>(frequency.QuadPart);
+        const double cycles = static_cast<double>(cyclesEnd - cyclesBegin);
+        return cycles > 0 ? elapsedNs / cycles : 0.0;
+    }();
+    ULONG64 cycles = 0;
+    if (nsPerCycle <= 0 || !QueryThreadCycleTime(GetCurrentThread(), &cycles)) {
         return 0;
     }
-    ULARGE_INTEGER kernelValue{}, userValue{};
-    kernelValue.LowPart = kernel.dwLowDateTime;
-    kernelValue.HighPart = kernel.dwHighDateTime;
-    userValue.LowPart = user.dwLowDateTime;
-    userValue.HighPart = user.dwHighDateTime;
-    return (kernelValue.QuadPart + userValue.QuadPart) * 100ull;
+    return static_cast<std::uint64_t>(static_cast<double>(cycles) * nsPerCycle);
 #elif defined(__linux__)
     timespec value{};
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
@@ -1023,6 +1043,7 @@ ContextToken CaptureCurrentContext() noexcept
         token.m_session = std::move(state);
         token.m_parentEventId = g_threadContext.parentEventId;
         token.m_frameId = g_threadContext.frameId;
+        token.m_traceSelected = g_threadContext.traceSelected;
     }
     return token;
 }

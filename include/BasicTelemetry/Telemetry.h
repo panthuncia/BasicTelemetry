@@ -47,6 +47,10 @@ struct SessionConfig
     std::size_t maximumStallEvents{ 100'000 };
     std::unordered_map<std::string, std::string> metadata;
     std::vector<SamplingTargetConfig> samplingTargets;
+    // Empty retains every trace event. Otherwise retain only these scopes and
+    // their descendants, including descendants reached through ContextToken.
+    // Summary distributions remain complete and are not filtered.
+    std::vector<std::string> traceRootScopes;
 };
 
 struct ScopeDefinition
@@ -213,6 +217,7 @@ private:
     std::shared_ptr<void> m_session;
     std::uint64_t m_parentEventId{};
     std::uint64_t m_frameId{};
+    bool m_traceSelected{};
 };
 
 class ContextBinding
