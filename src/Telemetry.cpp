@@ -302,6 +302,11 @@ struct TelemetryState
 
 std::atomic<std::shared_ptr<TelemetryState>> g_activeState;
 std::atomic<std::uint64_t> g_nextSessionId{ 1 };
+// True only while the active session tracks allocations. RecordAllocation runs
+// on every heap allocation in hooked processes; checking this before touching
+// g_activeState keeps untracked sessions from serializing all allocating
+// threads on the atomic<shared_ptr> load's internal lock.
+std::atomic<bool> g_allocationTrackingActive{ false };
 
 struct ThreadContext
 {
@@ -515,6 +520,7 @@ Session::Session(SessionConfig config, std::vector<std::shared_ptr<Sink>> sinks)
     if (!g_activeState.compare_exchange_strong(expected, m_impl->state)) {
         throw std::runtime_error("BasicTelemetry supports one active process session");
     }
+    g_allocationTrackingActive.store(m_impl->state->config.trackAllocations, std::memory_order_release);
 }
 
 Session::~Session()
@@ -591,6 +597,7 @@ void Session::Flush()
     }
     m_impl->flushed = true;
     m_impl->state->accepting.store(false, std::memory_order_release);
+    g_allocationTrackingActive.store(false, std::memory_order_release);
     auto expected = m_impl->state;
     std::shared_ptr<TelemetryState> empty;
     g_activeState.compare_exchange_strong(expected, empty);
@@ -1089,6 +1096,10 @@ void MaxGauge(std::string_view name, std::int64_t value) noexcept
 AllocationToken RecordAllocation(std::size_t size, AllocationDomain domain) noexcept
 {
     AllocationToken token;
+    if (!g_threadContext.currentScope ||
+        !g_allocationTrackingActive.load(std::memory_order_acquire)) {
+        return token;
+    }
     auto state = CurrentState();
     if (!state || !state->accepting.load(std::memory_order_acquire) ||
         !state->config.trackAllocations || !g_threadContext.currentScope ||
