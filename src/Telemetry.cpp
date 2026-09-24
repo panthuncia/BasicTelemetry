@@ -275,6 +275,7 @@ struct TelemetryState
     {
         try {
             auto* shard = ThreadLocalShard();
+            std::scoped_lock lock(shard->chunkMutex);
             if (!shard->current || shard->current->size == shard->current->capacity) {
                 if (shard->quotaExhausted) {
                     shard->droppedEvents.fetch_add(1, std::memory_order_relaxed);
@@ -288,7 +289,6 @@ struct TelemetryState
                 }
                 auto chunk = std::make_unique<TraceChunk>();
                 chunk->capacity = std::min(kEventsPerChunk, maximumEvents - begin);
-                std::scoped_lock lock(shard->chunkMutex);
                 shard->current = chunk.get();
                 shard->chunks.push_back(std::move(chunk));
             }
@@ -375,6 +375,7 @@ SessionSnapshot SnapshotState(const TelemetryState& state, std::uint64_t endedAt
         destination.stillLive += source.stillLive;
     };
     for (const auto& shard : shards) {
+        std::scoped_lock shardLock(shard->chunkMutex);
         for (const auto& [id, aggregate] : shard->scopeAggregates)
             mergeAggregate(mergedAggregates[id], aggregate);
         for (const auto& [id, callsite] : shard->definitions) {
@@ -723,30 +724,33 @@ Scope::~Scope()
 
     try {
         auto* shard = m_impl->state->ThreadLocalShard();
-        shard->definitions.try_emplace(m_impl->callsite->id, m_impl->callsite);
-        if (!m_impl->warmup) {
-            auto& aggregate = shard->scopeAggregates[m_impl->callsite->id];
-            aggregate.inclusive.Record(
-                inclusiveNs,
-                m_impl->state->config.retainedSamplesPerMetric);
-            aggregate.self.Record(
-                selfNs,
-                m_impl->state->config.retainedSamplesPerMetric);
-            if (m_impl->state->config.measureThreadCpuTime) {
-                aggregate.threadCpu.Record(
-                    threadCpuNs,
+        {
+            std::scoped_lock shardLock(shard->chunkMutex);
+            shard->definitions.try_emplace(m_impl->callsite->id, m_impl->callsite);
+            if (!m_impl->warmup) {
+                auto& aggregate = shard->scopeAggregates[m_impl->callsite->id];
+                aggregate.inclusive.Record(
+                    inclusiveNs,
                     m_impl->state->config.retainedSamplesPerMetric);
-                aggregate.nonRunning.Record(
-                    nonRunningNs,
+                aggregate.self.Record(
+                    selfNs,
                     m_impl->state->config.retainedSamplesPerMetric);
+                if (m_impl->state->config.measureThreadCpuTime) {
+                    aggregate.threadCpu.Record(
+                        threadCpuNs,
+                        m_impl->state->config.retainedSamplesPerMetric);
+                    aggregate.nonRunning.Record(
+                        nonRunningNs,
+                        m_impl->state->config.retainedSamplesPerMetric);
+                }
             }
-            if (!m_impl->state->samplingTargets.empty()) {
-                std::scoped_lock lock(m_impl->state->mutex);
-                for (auto& target : m_impl->state->samplingTargets) {
-                    if (target.config.name == m_impl->callsite->name
-                        && (target.config.category.empty() || target.config.category == m_impl->callsite->category)) {
-                        target.sampler.AddSample(static_cast<double>(inclusiveNs));
-                    }
+        }
+        if (!m_impl->warmup && !m_impl->state->samplingTargets.empty()) {
+            std::scoped_lock lock(m_impl->state->mutex);
+            for (auto& target : m_impl->state->samplingTargets) {
+                if (target.config.name == m_impl->callsite->name
+                    && (target.config.category.empty() || target.config.category == m_impl->callsite->category)) {
+                    target.sampler.AddSample(static_cast<double>(inclusiveNs));
                 }
             }
         }
