@@ -275,6 +275,7 @@ struct TelemetryState
     {
         try {
             auto* shard = ThreadLocalShard();
+            std::scoped_lock lock(shard->chunkMutex);
             if (!shard->current || shard->current->size == shard->current->capacity) {
                 if (shard->quotaExhausted) {
                     shard->droppedEvents.fetch_add(1, std::memory_order_relaxed);
@@ -288,7 +289,6 @@ struct TelemetryState
                 }
                 auto chunk = std::make_unique<TraceChunk>();
                 chunk->capacity = std::min(kEventsPerChunk, maximumEvents - begin);
-                std::scoped_lock lock(shard->chunkMutex);
                 shard->current = chunk.get();
                 shard->chunks.push_back(std::move(chunk));
             }
@@ -302,6 +302,11 @@ struct TelemetryState
 
 std::atomic<std::shared_ptr<TelemetryState>> g_activeState;
 std::atomic<std::uint64_t> g_nextSessionId{ 1 };
+// True only while the active session tracks allocations. RecordAllocation runs
+// on every heap allocation in hooked processes; checking this before touching
+// g_activeState keeps untracked sessions from serializing all allocating
+// threads on the atomic<shared_ptr> load's internal lock.
+std::atomic<bool> g_allocationTrackingActive{ false };
 
 struct ThreadContext
 {
@@ -375,6 +380,7 @@ SessionSnapshot SnapshotState(const TelemetryState& state, std::uint64_t endedAt
         destination.stillLive += source.stillLive;
     };
     for (const auto& shard : shards) {
+        std::scoped_lock shardLock(shard->chunkMutex);
         for (const auto& [id, aggregate] : shard->scopeAggregates)
             mergeAggregate(mergedAggregates[id], aggregate);
         for (const auto& [id, callsite] : shard->definitions) {
@@ -514,6 +520,7 @@ Session::Session(SessionConfig config, std::vector<std::shared_ptr<Sink>> sinks)
     if (!g_activeState.compare_exchange_strong(expected, m_impl->state)) {
         throw std::runtime_error("BasicTelemetry supports one active process session");
     }
+    g_allocationTrackingActive.store(m_impl->state->config.trackAllocations, std::memory_order_release);
 }
 
 Session::~Session()
@@ -590,6 +597,7 @@ void Session::Flush()
     }
     m_impl->flushed = true;
     m_impl->state->accepting.store(false, std::memory_order_release);
+    g_allocationTrackingActive.store(false, std::memory_order_release);
     auto expected = m_impl->state;
     std::shared_ptr<TelemetryState> empty;
     g_activeState.compare_exchange_strong(expected, empty);
@@ -723,30 +731,33 @@ Scope::~Scope()
 
     try {
         auto* shard = m_impl->state->ThreadLocalShard();
-        shard->definitions.try_emplace(m_impl->callsite->id, m_impl->callsite);
-        if (!m_impl->warmup) {
-            auto& aggregate = shard->scopeAggregates[m_impl->callsite->id];
-            aggregate.inclusive.Record(
-                inclusiveNs,
-                m_impl->state->config.retainedSamplesPerMetric);
-            aggregate.self.Record(
-                selfNs,
-                m_impl->state->config.retainedSamplesPerMetric);
-            if (m_impl->state->config.measureThreadCpuTime) {
-                aggregate.threadCpu.Record(
-                    threadCpuNs,
+        {
+            std::scoped_lock shardLock(shard->chunkMutex);
+            shard->definitions.try_emplace(m_impl->callsite->id, m_impl->callsite);
+            if (!m_impl->warmup) {
+                auto& aggregate = shard->scopeAggregates[m_impl->callsite->id];
+                aggregate.inclusive.Record(
+                    inclusiveNs,
                     m_impl->state->config.retainedSamplesPerMetric);
-                aggregate.nonRunning.Record(
-                    nonRunningNs,
+                aggregate.self.Record(
+                    selfNs,
                     m_impl->state->config.retainedSamplesPerMetric);
+                if (m_impl->state->config.measureThreadCpuTime) {
+                    aggregate.threadCpu.Record(
+                        threadCpuNs,
+                        m_impl->state->config.retainedSamplesPerMetric);
+                    aggregate.nonRunning.Record(
+                        nonRunningNs,
+                        m_impl->state->config.retainedSamplesPerMetric);
+                }
             }
-            if (!m_impl->state->samplingTargets.empty()) {
-                std::scoped_lock lock(m_impl->state->mutex);
-                for (auto& target : m_impl->state->samplingTargets) {
-                    if (target.config.name == m_impl->callsite->name
-                        && (target.config.category.empty() || target.config.category == m_impl->callsite->category)) {
-                        target.sampler.AddSample(static_cast<double>(inclusiveNs));
-                    }
+        }
+        if (!m_impl->warmup && !m_impl->state->samplingTargets.empty()) {
+            std::scoped_lock lock(m_impl->state->mutex);
+            for (auto& target : m_impl->state->samplingTargets) {
+                if (target.config.name == m_impl->callsite->name
+                    && (target.config.category.empty() || target.config.category == m_impl->callsite->category)) {
+                    target.sampler.AddSample(static_cast<double>(inclusiveNs));
                 }
             }
         }
@@ -1085,6 +1096,10 @@ void MaxGauge(std::string_view name, std::int64_t value) noexcept
 AllocationToken RecordAllocation(std::size_t size, AllocationDomain domain) noexcept
 {
     AllocationToken token;
+    if (!g_threadContext.currentScope ||
+        !g_allocationTrackingActive.load(std::memory_order_acquire)) {
+        return token;
+    }
     auto state = CurrentState();
     if (!state || !state->accepting.load(std::memory_order_acquire) ||
         !state->config.trackAllocations || !g_threadContext.currentScope ||

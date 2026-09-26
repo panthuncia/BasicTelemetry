@@ -1,6 +1,7 @@
 #include <BasicTelemetry/Artifacts.h>
 #include <BasicTelemetry/Telemetry.h>
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <filesystem>
@@ -285,6 +286,34 @@ void ConcurrentQuotaExhaustion()
     assert(snapshot.droppedEvents == threadCount * eventsPerThread - snapshot.events.size());
     assert(snapshot.droppedContendedScopeSamples == 0);
 }
+
+void ConcurrentSnapshots()
+{
+    constexpr std::size_t threadCount = 8;
+    Session session({
+        .mode = CaptureMode::Trace,
+        .retainedSamplesPerMetric = 64,
+        .maximumTraceEvents = 100'000,
+    });
+    std::atomic<bool> stop{};
+    std::vector<std::thread> workers;
+    workers.reserve(threadCount);
+    for (std::size_t threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
+        workers.emplace_back([&stop] {
+            static const Callsite callsite("snapshot.concurrent");
+            while (!stop.load(std::memory_order_relaxed)) Scope scope(callsite);
+        });
+    }
+    for (std::size_t index = 0; index < 100; ++index) {
+        const auto snapshot = session.Snapshot();
+        assert(snapshot.droppedContendedScopeSamples == 0);
+    }
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& worker : workers) worker.join();
+    const auto snapshot = session.Snapshot();
+    assert(!snapshot.scopes.empty());
+    assert(!snapshot.events.empty());
+}
 }
 
 int main()
@@ -299,5 +328,6 @@ int main()
     StatisticalSampling();
     ConcurrentChunkedTrace();
     ConcurrentQuotaExhaustion();
+    ConcurrentSnapshots();
     return 0;
 }
