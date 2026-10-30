@@ -79,7 +79,9 @@ bool WriteJson(const std::filesystem::path& path, const json& value, std::string
         error = "failed to open " + path.string();
         return false;
     }
-    output << std::setw(2) << value << '\n';
+    // Recorded names can carry non-UTF-8 bytes (game paths in a legacy code page): replace them rather than throw, since this
+    // runs from Session's destructor.
+    output << value.dump(2, ' ', false, json::error_handler_t::replace) << '\n';
     if (!output) {
         error = "failed to write " + path.string();
         return false;
