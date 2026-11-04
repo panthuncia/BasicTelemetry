@@ -117,17 +117,24 @@ struct ScopeAggregateData
     std::uint64_t stillLive{};
 };
 
-struct MetricData
+// One thread's view of a metric. Metrics are recorded per thread and merged when
+// a snapshot is taken, so recording never takes a process-wide lock.
+struct ThreadMetricData
 {
-    StableId id{};
     std::string name;
-    std::string kind;
-    std::int64_t current{};
+    std::string_view kind;
+    // Counter: added since this thread last called Set.
+    std::int64_t added{};
+    // Largest running total this thread saw, and the largest gauge value.
     std::int64_t maximum{ std::numeric_limits<std::int64_t>::min() };
+    // Gauge: latest value. Counter: value of this thread's latest Set.
+    std::int64_t latest{};
+    std::uint64_t latestStampNs{};
+    bool usedMax{};
     DistributionData distribution;
 };
 
-struct TelemetryState
+struct TelemetryState : std::enable_shared_from_this<TelemetryState>
 {
     static constexpr std::size_t kEventsPerChunk = 1'024;
     static constexpr std::size_t kInlineTextBytes = 128;
@@ -162,6 +169,7 @@ struct TelemetryState
         TraceChunk* current{};
         std::unordered_map<StableId, ScopeAggregateData> scopeAggregates;
         std::unordered_map<StableId, const Callsite*> definitions;
+        std::unordered_map<StableId, ThreadMetricData> metrics;
         std::atomic<std::uint64_t> droppedEvents{};
         std::uint64_t nextEventId{};
         std::uint64_t eventIdEnd{};
@@ -227,7 +235,6 @@ struct TelemetryState
     mutable std::mutex mutex;
     std::unordered_map<StableId, ScopeDefinition> definitions;
     std::unordered_map<StableId, ScopeAggregateData> scopeAggregates;
-    std::unordered_map<StableId, MetricData> metrics;
     std::vector<FrameSnapshot> frames;
     std::vector<AllocationEventSnapshot> allocations;
     std::unordered_map<std::uint64_t, std::size_t> allocationEventIndices;
@@ -301,6 +308,10 @@ struct TelemetryState
 };
 
 std::atomic<std::shared_ptr<TelemetryState>> g_activeState;
+// The active session's id, or 0. Loading g_activeState takes a lock and bumps a
+// shared reference count, which stops scaling once many threads open scopes. Each
+// thread instead keeps its own reference and reloads it only when this changes.
+std::atomic<std::uint64_t> g_activeSessionId{ 0 };
 std::atomic<std::uint64_t> g_nextSessionId{ 1 };
 // True only while the active session tracks allocations. RecordAllocation runs
 // on every heap allocation in hooked processes; checking this before touching
@@ -326,12 +337,60 @@ std::uint64_t ThreadId() noexcept
         std::hash<std::thread::id>{}(std::this_thread::get_id()));
 }
 
-std::shared_ptr<TelemetryState> CurrentState() noexcept
+constexpr std::uint64_t kThreadStateCacheDestroyed = std::numeric_limits<std::uint64_t>::max();
+
+struct ThreadStateCache
+{
+    std::shared_ptr<TelemetryState> state;
+    std::uint64_t sessionId{};
+    // Open scopes hold a raw pointer to their session. A session replaced while
+    // some are open stays here until the last of them closes.
+    std::vector<std::shared_ptr<TelemetryState>> retired;
+    std::size_t openScopes{};
+
+    ~ThreadStateCache() { sessionId = kThreadStateCacheDestroyed; }
+};
+
+thread_local ThreadStateCache g_threadStateCache;
+
+// Destructors that run after this thread's cache is gone record nothing.
+TelemetryState* RefreshThreadStateCache(ThreadStateCache& cache, std::uint64_t sessionId) noexcept
+{
+    if (cache.sessionId == kThreadStateCacheDestroyed) {
+        return nullptr;
+    }
+    auto previous = std::move(cache.state);
+    cache.state = sessionId != 0 ? g_activeState.load(std::memory_order_acquire) : nullptr;
+    cache.sessionId = sessionId;
+    if (previous && cache.openScopes != 0) {
+        cache.retired.push_back(std::move(previous));
+    }
+    return cache.state.get();
+}
+
+TelemetryState* CurrentStatePointer() noexcept
 {
     if (g_threadContext.boundState) {
-        return g_threadContext.boundState;
+        return g_threadContext.boundState.get();
     }
-    return g_activeState.load(std::memory_order_acquire);
+    auto& cache = g_threadStateCache;
+    const auto sessionId = g_activeSessionId.load(std::memory_order_acquire);
+    if (cache.sessionId != sessionId) {
+        return RefreshThreadStateCache(cache, sessionId);
+    }
+    return cache.state.get();
+}
+
+TelemetryState* AcceptingState() noexcept
+{
+    auto* state = CurrentStatePointer();
+    return state && state->accepting.load(std::memory_order_acquire) ? state : nullptr;
+}
+
+std::shared_ptr<TelemetryState> CurrentState() noexcept
+{
+    auto* state = CurrentStatePointer();
+    return state ? state->shared_from_this() : nullptr;
 }
 
 void RegisterDefinition(TelemetryState& state, const Callsite& callsite)
@@ -439,16 +498,46 @@ SessionSnapshot SnapshotState(const TelemetryState& state, std::uint64_t endedAt
     }
     std::ranges::sort(result.scopes, {}, &ScopeAggregateSnapshot::scopeId);
 
-    result.metrics.reserve(state.metrics.size());
-    for (const auto& [id, metric] : state.metrics) {
+    struct MergedMetric
+    {
+        std::string name;
+        std::string_view kind;
+        std::int64_t added{};
+        std::int64_t maximum{ std::numeric_limits<std::int64_t>::min() };
+        std::int64_t latest{};
+        std::uint64_t latestStampNs{};
+        bool usedMax{};
+        DistributionData distribution;
+    };
+    std::unordered_map<StableId, MergedMetric> mergedMetrics;
+    for (const auto& shard : shards) {
+        std::scoped_lock shardLock(shard->chunkMutex);
+        for (const auto& [id, metric] : shard->metrics) {
+            auto& merged = mergedMetrics[id];
+            if (merged.name.empty()) {
+                merged.name = metric.name;
+                merged.kind = metric.kind;
+            }
+            merged.added += metric.added;
+            merged.maximum = std::max(merged.maximum, metric.maximum);
+            merged.usedMax = merged.usedMax || metric.usedMax;
+            if (metric.latestStampNs >= merged.latestStampNs) {
+                merged.latest = metric.latest;
+                merged.latestStampNs = metric.latestStampNs;
+            }
+            merged.distribution.Merge(metric.distribution, state.config.retainedSamplesPerMetric);
+        }
+    }
+    result.metrics.reserve(mergedMetrics.size());
+    for (const auto& [id, metric] : mergedMetrics) {
+        // A counter's total spans threads, so it can exceed any one thread's maximum.
+        const auto current = metric.usedMax ? metric.maximum : metric.latest + metric.added;
         result.metrics.push_back({
             .id = id,
             .name = metric.name,
-            .kind = metric.kind,
-            .current = metric.current,
-            .maximum = metric.maximum == std::numeric_limits<std::int64_t>::min()
-                ? metric.current
-                : metric.maximum,
+            .kind = std::string(metric.kind),
+            .current = current,
+            .maximum = std::max(metric.maximum, current),
             .distribution = metric.distribution.Snapshot(),
         });
     }
@@ -486,15 +575,69 @@ SessionSnapshot SnapshotState(const TelemetryState& state, std::uint64_t endedAt
     return result;
 }
 
-MetricData& FindMetric(TelemetryState& state, StableId id, std::string_view name, std::string_view kind)
+// Kind must be a string literal; it is stored as a view.
+template <class Function>
+void UpdateThreadMetric(TelemetryState& state, StableId id, std::string_view name, std::string_view kind, Function&& update) noexcept
 {
-    auto [it, inserted] = state.metrics.try_emplace(id);
-    if (inserted) {
-        it->second.id = id;
-        it->second.name = name;
-        it->second.kind = kind;
+    try {
+        auto* shard = state.ThreadLocalShard();
+        std::scoped_lock lock(shard->chunkMutex);
+        auto [it, inserted] = shard->metrics.try_emplace(id);
+        if (inserted) {
+            it->second.name = name;
+            it->second.kind = kind;
+        }
+        update(it->second);
     }
-    return it->second;
+    catch (...) {
+    }
+}
+
+void AddToCounter(TelemetryState& state, StableId id, std::string_view name, std::int64_t delta) noexcept
+{
+    UpdateThreadMetric(state, id, name, "counter", [delta](ThreadMetricData& metric) {
+        metric.added += delta;
+        metric.maximum = std::max(metric.maximum, metric.latest + metric.added);
+    });
+}
+
+void SetCounterValue(TelemetryState& state, StableId id, std::string_view name, std::int64_t value) noexcept
+{
+    const auto stamp = NowNs();
+    UpdateThreadMetric(state, id, name, "counter", [value, stamp](ThreadMetricData& metric) {
+        metric.added = 0;
+        metric.latest = value;
+        metric.latestStampNs = stamp;
+        metric.maximum = std::max(metric.maximum, value);
+    });
+}
+
+void SetGaugeValue(TelemetryState& state, StableId id, std::string_view name, std::int64_t value) noexcept
+{
+    const auto stamp = NowNs();
+    UpdateThreadMetric(state, id, name, "gauge", [&state, value, stamp](ThreadMetricData& metric) {
+        metric.latest = value;
+        metric.latestStampNs = stamp;
+        metric.maximum = std::max(metric.maximum, value);
+        metric.distribution.Record(
+            static_cast<std::uint64_t>(std::max<std::int64_t>(0, value)),
+            state.config.retainedSamplesPerMetric);
+    });
+}
+
+void MaxGaugeValue(TelemetryState& state, StableId id, std::string_view name, std::int64_t value) noexcept
+{
+    UpdateThreadMetric(state, id, name, "gauge", [value](ThreadMetricData& metric) {
+        metric.maximum = std::max(metric.maximum, value);
+        metric.usedMax = true;
+    });
+}
+
+void RecordDistributionValue(TelemetryState& state, StableId id, std::string_view name, std::uint64_t value) noexcept
+{
+    UpdateThreadMetric(state, id, name, "distribution", [&state, value](ThreadMetricData& metric) {
+        metric.distribution.Record(value, state.config.retainedSamplesPerMetric);
+    });
 }
 }
 
@@ -520,6 +663,7 @@ Session::Session(SessionConfig config, std::vector<std::shared_ptr<Sink>> sinks)
     if (!g_activeState.compare_exchange_strong(expected, m_impl->state)) {
         throw std::runtime_error("BasicTelemetry supports one active process session");
     }
+    g_activeSessionId.store(m_impl->state->sessionId, std::memory_order_release);
     g_allocationTrackingActive.store(m_impl->state->config.trackAllocations, std::memory_order_release);
 }
 
@@ -598,6 +742,8 @@ void Session::Flush()
     m_impl->flushed = true;
     m_impl->state->accepting.store(false, std::memory_order_release);
     g_allocationTrackingActive.store(false, std::memory_order_release);
+    auto expectedSessionId = m_impl->state->sessionId;
+    g_activeSessionId.compare_exchange_strong(expectedSessionId, 0);
     auto expected = m_impl->state;
     std::shared_ptr<TelemetryState> empty;
     g_activeState.compare_exchange_strong(expected, empty);
@@ -653,7 +799,8 @@ ContextBinding::~ContextBinding()
 
 struct Scope::Impl
 {
-    std::shared_ptr<TelemetryState> state;
+    // Kept alive by this thread's cache, or by the ContextBinding the scope runs under.
+    TelemetryState* state{};
     const Callsite* callsite{};
     Scope* previousScope{};
     std::uint64_t eventId{};
@@ -673,14 +820,14 @@ struct Scope::Impl
 
 Scope::Scope(const Callsite& callsite) noexcept
 {
-    auto state = CurrentState();
-    if (!state || !state->accepting.load(std::memory_order_acquire)) {
+    auto* state = AcceptingState();
+    if (!state) {
         return;
     }
     try {
         static_assert(sizeof(Impl) <= sizeof(m_storage));
         m_impl = ::new (static_cast<void*>(m_storage)) Impl;
-        m_impl->state = std::move(state);
+        m_impl->state = state;
         m_impl->callsite = &callsite;
         m_impl->previousScope = g_threadContext.currentScope;
         m_impl->parentEventId = m_impl->previousScope && m_impl->previousScope->m_impl
@@ -700,6 +847,7 @@ Scope::Scope(const Callsite& callsite) noexcept
             m_impl->startThreadCpuNs = CurrentThreadCpuTimeNs();
         }
         g_threadContext.currentScope = this;
+        ++g_threadStateCache.openScopes;
     }
     catch (...) {
         if (m_impl) {
@@ -791,6 +939,10 @@ Scope::~Scope()
     }
     m_impl->~Impl();
     m_impl = nullptr;
+    auto& cache = g_threadStateCache;
+    if (--cache.openScopes == 0 && !cache.retired.empty()) {
+        cache.retired.clear();
+    }
 }
 
 void Scope::Text(std::string_view text)
@@ -816,7 +968,7 @@ ContextToken Scope::CaptureContext() const noexcept
 {
     ContextToken token;
     if (m_impl) {
-        token.m_session = m_impl->state;
+        token.m_session = m_impl->state->shared_from_this();
         token.m_parentEventId = m_impl->eventId;
         token.m_frameId = m_impl->frameId;
         token.m_traceSelected = m_impl->traceSelected;
@@ -906,29 +1058,15 @@ Counter::Counter(std::string_view name)
 
 void Counter::Add(std::int64_t delta) const noexcept
 {
-    if (auto state = CurrentState(); state && state->accepting.load(std::memory_order_acquire)) {
-        try {
-            std::scoped_lock lock(state->mutex);
-            auto& metric = FindMetric(*state, m_id, m_name, "counter");
-            metric.current += delta;
-            metric.maximum = std::max(metric.maximum, metric.current);
-        }
-        catch (...) {
-        }
+    if (auto* state = AcceptingState()) {
+        AddToCounter(*state, m_id, m_name, delta);
     }
 }
 
 void Counter::Set(std::int64_t value) const noexcept
 {
-    if (auto state = CurrentState(); state && state->accepting.load(std::memory_order_acquire)) {
-        try {
-            std::scoped_lock lock(state->mutex);
-            auto& metric = FindMetric(*state, m_id, m_name, "counter");
-            metric.current = value;
-            metric.maximum = std::max(metric.maximum, value);
-        }
-        catch (...) {
-        }
+    if (auto* state = AcceptingState()) {
+        SetCounterValue(*state, m_id, m_name, value);
     }
 }
 
@@ -940,32 +1078,15 @@ Gauge::Gauge(std::string_view name)
 
 void Gauge::Set(std::int64_t value) const noexcept
 {
-    if (auto state = CurrentState(); state && state->accepting.load(std::memory_order_acquire)) {
-        try {
-            std::scoped_lock lock(state->mutex);
-            auto& metric = FindMetric(*state, m_id, m_name, "gauge");
-            metric.current = value;
-            metric.maximum = std::max(metric.maximum, value);
-            metric.distribution.Record(
-                static_cast<std::uint64_t>(std::max<std::int64_t>(0, value)),
-                state->config.retainedSamplesPerMetric);
-        }
-        catch (...) {
-        }
+    if (auto* state = AcceptingState()) {
+        SetGaugeValue(*state, m_id, m_name, value);
     }
 }
 
 void Gauge::Max(std::int64_t value) const noexcept
 {
-    if (auto state = CurrentState(); state && state->accepting.load(std::memory_order_acquire)) {
-        try {
-            std::scoped_lock lock(state->mutex);
-            auto& metric = FindMetric(*state, m_id, m_name, "gauge");
-            metric.maximum = std::max(metric.maximum, value);
-            metric.current = metric.maximum;
-        }
-        catch (...) {
-        }
+    if (auto* state = AcceptingState()) {
+        MaxGaugeValue(*state, m_id, m_name, value);
     }
 }
 
@@ -977,26 +1098,19 @@ Distribution::Distribution(std::string_view name)
 
 void Distribution::Record(std::uint64_t value) const noexcept
 {
-    if (auto state = CurrentState(); state && state->accepting.load(std::memory_order_acquire)) {
-        try {
-            std::scoped_lock lock(state->mutex);
-            auto& metric = FindMetric(*state, m_id, m_name, "distribution");
-            metric.distribution.Record(value, state->config.retainedSamplesPerMetric);
-        }
-        catch (...) {
-        }
+    if (auto* state = AcceptingState()) {
+        RecordDistributionValue(*state, m_id, m_name, value);
     }
 }
 
 bool Enabled() noexcept
 {
-    const auto state = CurrentState();
-    return state && state->accepting.load(std::memory_order_relaxed);
+    return AcceptingState() != nullptr;
 }
 
 CaptureMode CurrentMode() noexcept
 {
-    const auto state = CurrentState();
+    const auto* state = CurrentStatePointer();
     return state ? state->config.mode : CaptureMode::Off;
 }
 
@@ -1075,22 +1189,30 @@ void SetCurrentScopeValue(std::uint64_t value) noexcept
 
 void Record(std::string_view name, std::uint64_t value) noexcept
 {
-    Distribution(name).Record(value);
+    if (auto* state = AcceptingState()) {
+        RecordDistributionValue(*state, MakeStableId(name), name, value);
+    }
 }
 
 void AddCounter(std::string_view name, std::int64_t delta) noexcept
 {
-    Counter(name).Add(delta);
+    if (auto* state = AcceptingState()) {
+        AddToCounter(*state, MakeStableId(name), name, delta);
+    }
 }
 
 void SetGauge(std::string_view name, std::int64_t value) noexcept
 {
-    Gauge(name).Set(value);
+    if (auto* state = AcceptingState()) {
+        SetGaugeValue(*state, MakeStableId(name), name, value);
+    }
 }
 
 void MaxGauge(std::string_view name, std::int64_t value) noexcept
 {
-    Gauge(name).Max(value);
+    if (auto* state = AcceptingState()) {
+        MaxGaugeValue(*state, MakeStableId(name), name, value);
+    }
 }
 
 AllocationToken RecordAllocation(std::size_t size, AllocationDomain domain) noexcept

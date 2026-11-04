@@ -42,8 +42,9 @@
 #define BT_PLOT(name, value) \
     do { \
         static const ::basic_telemetry::Gauge BASIC_TELEMETRY_JOIN(_btPlot, __LINE__){ name }; \
-        BASIC_TELEMETRY_JOIN(_btPlot, __LINE__).Set(static_cast<std::int64_t>(value)); \
-        TracyPlot((name), (value)); \
+        const auto _btPlotValue = (value); \
+        BASIC_TELEMETRY_JOIN(_btPlot, __LINE__).Set(static_cast<std::int64_t>(_btPlotValue)); \
+        TracyPlot((name), _btPlotValue); \
     } while (false)
 
 #define BT_FRAME_MARK() FrameMark

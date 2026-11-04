@@ -1,11 +1,17 @@
+// These tests check everything with assert, so keep it active in optimized builds.
+#undef NDEBUG
+
 #include <BasicTelemetry/Artifacts.h>
 #include <BasicTelemetry/Telemetry.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cmath>
 #include <filesystem>
+#include <memory>
 #include <memory_resource>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -58,7 +64,8 @@ void NestedScopesAndMetrics()
 
 void FilteredTraceRoots()
 {
-    Session session({ .mode = CaptureMode::Trace, .maximumTraceEvents = 3,
+    // Quota is reserved per thread in 1024-event chunks; two threads record here.
+    Session session({ .mode = CaptureMode::Trace, .maximumTraceEvents = 2 * 1024,
         .traceRootScopes = { "selected.root" } });
     static const Callsite outsideCallsite("outside");
     static const Callsite rootCallsite("selected.root");
@@ -287,6 +294,81 @@ void ConcurrentQuotaExhaustion()
     assert(snapshot.droppedContendedScopeSamples == 0);
 }
 
+void MetricsMergeAcrossThreads()
+{
+    constexpr std::size_t threadCount = 8;
+    constexpr std::int64_t additionsPerThread = 1'000;
+    Session session({ .mode = CaptureMode::Summary, .retainedSamplesPerMetric = 16 });
+    std::vector<std::thread> workers;
+    workers.reserve(threadCount);
+    for (std::size_t threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
+        workers.emplace_back([threadIndex] {
+            for (std::int64_t index = 0; index < additionsPerThread; ++index) {
+                AddCounter("merge.named_counter");
+                Record("merge.distribution", 5);
+            }
+            MaxGauge("merge.max_gauge", static_cast<std::int64_t>(threadIndex));
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    SetGauge("merge.gauge", 7);
+    SetGauge("merge.gauge", 3);
+
+    const auto snapshot = session.Snapshot();
+    const auto find = [&snapshot](std::string_view name) {
+        const auto metric = std::ranges::find(snapshot.metrics, name, &MetricSnapshot::name);
+        assert(metric != snapshot.metrics.end());
+        return *metric;
+    };
+    const auto counter = find("merge.named_counter");
+    assert(counter.kind == "counter");
+    assert(counter.current == threadCount * additionsPerThread);
+    assert(counter.maximum == counter.current);
+    const auto distribution = find("merge.distribution");
+    assert(distribution.distribution.count == threadCount * additionsPerThread);
+    assert(distribution.distribution.total == 5 * threadCount * additionsPerThread);
+    assert(distribution.distribution.retainedSamples.size() == 16);
+    const auto maxGauge = find("merge.max_gauge");
+    assert(maxGauge.current == threadCount - 1);
+    const auto gauge = find("merge.gauge");
+    assert(gauge.current == 3);
+    assert(gauge.maximum == 7);
+    assert(gauge.distribution.count == 2);
+}
+
+void SessionReplacedWhileScopeOpen()
+{
+    static const Callsite outerCallsite("replaced.outer");
+    static const Callsite innerCallsite("replaced.inner");
+    auto first = std::make_unique<Session>(SessionConfig{ .mode = CaptureMode::Summary });
+    {
+        // The outer scope's session ends and is destroyed while the scope is open.
+        Scope outer(outerCallsite);
+        assert(outer.IsActive());
+        first.reset();
+        assert(!Enabled());
+        Session second({ .mode = CaptureMode::Summary });
+        assert(Enabled());
+        {
+            Scope inner(innerCallsite);
+            assert(inner.IsActive());
+        }
+        const auto snapshot = second.Snapshot();
+        assert(snapshot.scopes.size() == 1);
+        assert(snapshot.scopes[0].scopeId == innerCallsite.id);
+    }
+    assert(!Enabled());
+    // No session has been created on this new thread until now.
+    Session third({ .mode = CaptureMode::Summary });
+    std::thread worker([] {
+        assert(Enabled());
+        Scope scope(innerCallsite);
+        assert(scope.IsActive());
+    });
+    worker.join();
+    assert(third.Snapshot().scopes.size() == 1);
+}
+
 void ConcurrentSnapshots()
 {
     constexpr std::size_t threadCount = 8;
@@ -329,5 +411,7 @@ int main()
     ConcurrentChunkedTrace();
     ConcurrentQuotaExhaustion();
     ConcurrentSnapshots();
+    MetricsMergeAcrossThreads();
+    SessionReplacedWhileScopeOpen();
     return 0;
 }
