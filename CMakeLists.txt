@@ -20,6 +20,7 @@ endif()
 
 add_library(BasicTelemetryCore STATIC
     src/Sampling.cpp
+    src/Tallies.cpp
     src/Telemetry.cpp
 )
 add_library(BasicTelemetry::Core ALIAS BasicTelemetryCore)
@@ -92,6 +93,16 @@ if(BASICTELEMETRY_BUILD_TESTS AND BASICTELEMETRY_BUILD_ARTIFACTS)
     add_executable(BasicTelemetryBenchmark tests/TelemetryBenchmark.cpp)
     target_compile_features(BasicTelemetryBenchmark PRIVATE cxx_std_23)
     target_link_libraries(BasicTelemetryBenchmark PRIVATE BasicTelemetryCore)
+endif()
+
+# Scope tallies and thread budgets need only the core library.
+if(BASICTELEMETRY_BUILD_TESTS)
+    enable_testing()
+    find_package(Threads REQUIRED)
+    add_executable(BasicTelemetryTallyTests tests/TallyTests.cpp)
+    target_compile_features(BasicTelemetryTallyTests PRIVATE cxx_std_23)
+    target_link_libraries(BasicTelemetryTallyTests PRIVATE BasicTelemetryCore Threads::Threads)
+    add_test(NAME BasicTelemetryTallyTests COMMAND BasicTelemetryTallyTests)
 endif()
 
 set(_basictelemetry_install_targets BasicTelemetryCore)
