@@ -139,8 +139,10 @@ struct TelemetryState : std::enable_shared_from_this<TelemetryState>
     static constexpr std::size_t kEventsPerChunk = 1'024;
     static constexpr std::size_t kInlineTextBytes = 128;
 
+    // Records keep the callsite's id, not the callsite: a callsite may be gone by
+    // the time a snapshot reads them (one owned by an object that was destroyed).
     struct TraceEventRecord {
-        const Callsite* callsite{};
+        StableId scopeId{};
         std::uint64_t eventId{};
         std::uint64_t parentEventId{};
         std::uint64_t frameId{};
@@ -168,7 +170,8 @@ struct TelemetryState : std::enable_shared_from_this<TelemetryState>
         std::vector<std::unique_ptr<TraceChunk>> chunks;
         TraceChunk* current{};
         std::unordered_map<StableId, ScopeAggregateData> scopeAggregates;
-        std::unordered_map<StableId, const Callsite*> definitions;
+        // Copied when this thread first closes a scope of the callsite, for the same reason.
+        std::unordered_map<StableId, ScopeDefinition> definitions;
         std::unordered_map<StableId, ThreadMetricData> metrics;
         std::atomic<std::uint64_t> droppedEvents{};
         std::uint64_t nextEventId{};
@@ -442,18 +445,8 @@ SessionSnapshot SnapshotState(const TelemetryState& state, std::uint64_t endedAt
         std::scoped_lock shardLock(shard->chunkMutex);
         for (const auto& [id, aggregate] : shard->scopeAggregates)
             mergeAggregate(mergedAggregates[id], aggregate);
-        for (const auto& [id, callsite] : shard->definitions) {
-            if (callsite && !mergedDefinitions.contains(id)) {
-                mergedDefinitions.emplace(id, ScopeDefinition{
-                    .id = id,
-                    .name = std::string(callsite->name),
-                    .category = std::string(callsite->category),
-                    .file = callsite->location.file_name(),
-                    .function = callsite->location.function_name(),
-                    .line = callsite->location.line(),
-                });
-            }
-        }
+        for (const auto& [id, definition] : shard->definitions)
+            mergedDefinitions.try_emplace(id, definition);
     }
     SessionSnapshot result;
     result.mode = state.config.mode;
@@ -549,7 +542,7 @@ SessionSnapshot SnapshotState(const TelemetryState& state, std::uint64_t endedAt
                 const auto& event = chunk->events[index];
                 result.events.push_back({
                     .eventId = event.eventId,
-                    .scopeId = event.callsite ? event.callsite->id : 0,
+                    .scopeId = event.scopeId,
                     .parentEventId = event.parentEventId,
                     .frameId = event.frameId,
                     .threadId = event.threadId,
@@ -881,7 +874,17 @@ Scope::~Scope()
         auto* shard = m_impl->state->ThreadLocalShard();
         {
             std::scoped_lock shardLock(shard->chunkMutex);
-            shard->definitions.try_emplace(m_impl->callsite->id, m_impl->callsite);
+            const auto& callsite = *m_impl->callsite;
+            if (!shard->definitions.contains(callsite.id)) {
+                shard->definitions.emplace(callsite.id, ScopeDefinition{
+                    .id = callsite.id,
+                    .name = std::string(callsite.name),
+                    .category = std::string(callsite.category),
+                    .file = callsite.location.file_name(),
+                    .function = callsite.location.function_name(),
+                    .line = callsite.location.line(),
+                });
+            }
             if (!m_impl->warmup) {
                 auto& aggregate = shard->scopeAggregates[m_impl->callsite->id];
                 aggregate.inclusive.Record(
@@ -916,7 +919,7 @@ Scope::~Scope()
                 ? m_impl->state->config.maximumTraceEvents
                 : m_impl->state->config.maximumStallEvents;
             TelemetryState::TraceEventRecord event{
-                .callsite = m_impl->callsite,
+                .scopeId = m_impl->callsite->id,
                 .eventId = m_impl->eventId,
                 .parentEventId = m_impl->parentEventId,
                 .frameId = m_impl->frameId,

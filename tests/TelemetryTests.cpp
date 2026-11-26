@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <memory>
 #include <memory_resource>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -396,10 +397,37 @@ void ConcurrentSnapshots()
     assert(!snapshot.scopes.empty());
     assert(!snapshot.events.empty());
 }
+
+// A callsite owned by an object (named at run time) may be destroyed before the
+// session ends. The snapshot must not read it.
+void CallsiteDestroyedBeforeSnapshot()
+{
+    // Quota is reserved per thread in 1024-event chunks; two threads record here.
+    Session session({ .mode = CaptureMode::Trace, .maximumTraceEvents = 2 * 1024 });
+    StableId id{};
+    {
+        auto name = std::make_unique<std::string>("owned.callsite");
+        auto callsite = std::make_unique<Callsite>(*name);
+        id = callsite->id;
+        {
+            Scope scope(*callsite);
+        }
+        std::thread worker([&] { Scope scope(*callsite); });
+        worker.join();
+        // Overwrite the name's bytes before they are freed, so a stale read shows.
+        std::fill(name->begin(), name->end(), 'x');
+    }
+    const auto snapshot = session.Snapshot();
+    const auto definition = std::ranges::find(snapshot.scopeDefinitions, id, &ScopeDefinition::id);
+    assert(definition != snapshot.scopeDefinitions.end());
+    assert(definition->name == "owned.callsite");
+    assert(std::ranges::count(snapshot.events, id, &ScopeEventSnapshot::scopeId) == 2);
+}
 }
 
 int main()
 {
+    CallsiteDestroyedBeforeSnapshot();
     assert(!Enabled());
     NestedScopesAndMetrics();
     assert(!Enabled());
